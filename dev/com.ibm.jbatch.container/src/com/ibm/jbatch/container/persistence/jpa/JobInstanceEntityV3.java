@@ -38,7 +38,7 @@ public class JobInstanceEntityV3 extends JobInstanceEntityV2 {
     public static final String IS_JOB_ACCESSIBLE_BY_ANY_GROUP_QUERY = "JobInstanceEntityV3.isJobAccessibleByGroupsQuery";
 
     @ElementCollection
-    @CollectionTable(name = "GROUPJOBASSOCIATIONV3", joinColumns = @JoinColumn(name = "FK_JOBINST_ID"))
+    @CollectionTable(name = "GROUPASSOCIATION", joinColumns = @JoinColumn(name = "FK_JOBINSTANCEID"))
     @Column(name = "GROUPNAME")
     private Set<String> groupNames;
 

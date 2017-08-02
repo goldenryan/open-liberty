@@ -484,7 +484,7 @@ public class DatabaseStoreImpl implements DatabaseStore {
         orm
                         .append(" </entity>").append(EOLN);
         if (Arrays.asList(entityClassNames).contains("com.ibm.jbatch.container.persistence.jpa.JobInstanceEntityV2")) {
-            orm            
+            orm
                             .append(" <entity class=\"com.ibm.jbatch.container.persistence.jpa.JobInstanceEntityV2\">").append(EOLN)
                             .append("  <table name=\"").append(tablePrefix).append("JOBINSTANCE\"/>").append(EOLN)
                             .append(" </entity>").append(EOLN);
@@ -495,13 +495,13 @@ public class DatabaseStoreImpl implements DatabaseStore {
                             .append("  <table name=\"").append(tablePrefix).append("JOBINSTANCE\"/>").append(EOLN)
                             .append("  <attributes>").append(EOLN)
                             .append("   <element-collection name=\"groupNames\" target-class=\"java.lang.String\">").append(EOLN)
-                            .append("    <collection-table name=\"").append(tablePrefix).append("GROUPJOBASSOCIATIONV3\">").append(EOLN)
-                            .append("     <join-column name=\"FK_JOBINST_ID\"/>").append(EOLN)
+                            .append("    <collection-table name=\"").append(tablePrefix).append("GROUPASSOCIATION\">").append(EOLN)
+                            .append("     <join-column name=\"FK_JOBINSTANCEID\"/>").append(EOLN)
                             .append("    </collection-table>").append(EOLN)
                             .append("   </element-collection>").append(EOLN)
                             .append("  </attributes>").append(EOLN)
                             .append(" </entity>").append(EOLN);
-            
+
         }
         orm
                         .append(" <entity class=\"com.ibm.jbatch.container.persistence.jpa.StepThreadExecutionEntity\">").append(EOLN)

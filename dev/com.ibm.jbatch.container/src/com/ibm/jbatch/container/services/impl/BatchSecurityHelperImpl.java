@@ -86,39 +86,4 @@ public class BatchSecurityHelperImpl implements BatchSecurityHelper {
         return (principals.isEmpty()) ? null : principals.iterator().next();
     }
 
-    /*
-     * refactor - new interface and impl in closed liberty
-     * 
-     * @Override
-     * public List<String> getGroupsForSubject(Subject subject) {
-     * SubjectHelper sh = new SubjectHelper();
-     * WSCredential cred;
-     * 
-     * try {
-     * 
-     * // this next block is not quite right
-     * // need to get the group name out from the groupID and this does not quite do it
-     * cred = sh.getWSCredential(subject);
-     * List<String> groupIDs = new ArrayList<String>();
-     * List<String> groups = new ArrayList<String>();
-     * groupIDs = cred.getGroupIds();
-     * String aGroupName;
-     * 
-     * Iterator it = groupIDs.iterator();
-     * while (it.hasNext()) {
-     * aGroupName = (String) it.next();
-     * groups.add(AccessIdUtil.getUniqueId(aGroupName));
-     * }
-     * 
-     * return groups;
-     * } catch (CredentialDestroyedException cdex) {
-     * throw new BatchContainerRuntimeException(cdex);
-     * } catch (CredentialExpiredException ceex) {
-     * throw new BatchContainerRuntimeException(ceex);
-     * } catch (Exception ex) {
-     * throw new BatchContainerRuntimeException(ex);
-     * }
-     * 
-     * }
-     */
 }
