@@ -582,7 +582,7 @@ public interface IPersistenceManagerService extends IBatchServiceBase {
      * @param listOfGroupsForSubject
      * @return
      */
-    public List<Long> getJobIDsForSubjectGroupNames(List<String> listOfGroupsForSubject);
+    public List<JobInstanceEntity> getJobInstancesForSubjectGroupNames(List<String> listOfGroupsForSubject, String subj);
 
     public JobInstanceEntity updateJobInstanceWithGroupNames(long jobInstanceId, Set<String> groupName);
 }

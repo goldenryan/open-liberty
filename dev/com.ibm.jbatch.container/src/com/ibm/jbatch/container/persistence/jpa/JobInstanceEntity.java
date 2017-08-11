@@ -296,7 +296,7 @@ public class JobInstanceEntity implements JobInstance, WSJobInstance, EntityCons
 
     /** {@inheritDoc} */
     @Override
-    public Set<String> getGroupNames() {
+    public Set<String> getGroupName() {
         return null;
     }
 

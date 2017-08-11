@@ -1410,7 +1410,7 @@ public class MemoryPersistenceManagerImpl extends AbstractPersistenceManager imp
 
     /** {@inheritDoc} */
     @Override
-    public List<Long> getJobIDsForSubjectGroupNames(List<String> listOfGroupsForSubject) {
+    public List<JobInstanceEntity> getJobInstancesForSubjectGroupNames(List<String> listOfGroupsForSubject, String subject) {
         // TODO Auto-generated method stub
         return null;
     }

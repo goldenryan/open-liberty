@@ -11,23 +11,24 @@
 package com.ibm.jbatch.container.ws;
 
 import java.util.List;
+
 import javax.batch.operations.JobSecurityException;
 import javax.batch.operations.NoSuchJobExecutionException;
 import javax.batch.operations.NoSuchJobInstanceException;
 
 /**
  * This is really a placeholder for the authorization service.
- * 
+ *
  * As we work to add the roles of submitter, monitor, and admin, we
  * need to flesh this out further.
- * 
+ *
  * Anything I write could imply to someone I've given this more thought than
  * I have.
- * 
+ *
  * Really the only thing that is accomplished with this is laying the
  * groundwork for the notion that authorization will function differently
  * in WAS than in the RI.
- * 
+ *
  * In WAS the JobOperator will need to use this service in addition to the WSJobManager.
  */
 public interface WSBatchAuthService {
@@ -47,7 +48,7 @@ public interface WSBatchAuthService {
      * checks performed against the corresponding instance. This means that for two executions, JE1 and JE2, of a given instance JI1,
      * this method will either succeed (i.e. return normally with <code>executionId</code>) or throw <code>JobSecurityException</code> for
      * the execution IDs of both JE1 and JE2.
-     * 
+     *
      * @param executionId
      * @return The input parameter <code>executionId</code> if the current security context is authorized to operate on the corresponding job execution
      * @throws NoSuchJobExecutionException if the job execution identified by <code>executionId</code> isn't present in the repository
@@ -60,21 +61,21 @@ public interface WSBatchAuthService {
     /**
      * In the RI, we used "current application name" as the tag.
      * In WebSphere, this will be more like "current runAs userid".
-     * 
+     *
      * @return the runAs "userid"
      */
     public abstract String getRunAsUser();
 
     /**
      * Returns with no exceptions if the current seucrity context is authorized to submit jobs
-     * 
+     *
      * @throws JobSecurityException if the current security context isn't authorized to submit jobs
      */
     public abstract void authorizedJobSubmission() throws JobSecurityException;
 
     /**
      * Returns the given execution id if the current user is authorized to restart it.
-     * 
+     *
      * @param executionId the executionId to restart
      * @return the given executionId that is authorized to be restarted
      * @throws NoSuchJobExecutionException
@@ -84,7 +85,7 @@ public interface WSBatchAuthService {
 
     /**
      * Returns the given instance id if the current user is authorized to restart it.
-     * 
+     *
      * @param instanceId the instanceId to restart
      * @return the given instanceId that is authorized to be restarted
      * @throws JobSecurityException if the current user does not have authority to restart the given instanceId
@@ -93,7 +94,7 @@ public interface WSBatchAuthService {
 
     /**
      * Returns the given execution id if the current user is authorized to stop it.
-     * 
+     *
      * @param executionId the executionId to stop
      * @return the given executionId that is authorized to be stopped
      * @throws NoSuchJobExecutionException
@@ -103,7 +104,7 @@ public interface WSBatchAuthService {
 
     /**
      * Returns the given instance id if the current user is authorized to stop it.
-     * 
+     *
      * @param instanceId the instanceId to stop
      * @return the given instanceId that is authorized to be stopped
      * @throws JobSecurityException if the current user does not have authority to stop the given instanceId
@@ -112,7 +113,7 @@ public interface WSBatchAuthService {
 
     /**
      * Returns the given instance id if the current user is authorized to purge it
-     * 
+     *
      * @param instanceId the job instanceId to purge
      * @return
      * @throws NoSuchJobInstanceException
@@ -142,7 +143,7 @@ public interface WSBatchAuthService {
 
     /**
      * /**
-     * 
+     *
      * @return true if the current user is part of the batchGroupMonitor role, false otherwise
      */
     public abstract boolean isGroupMonitor();
@@ -154,7 +155,7 @@ public interface WSBatchAuthService {
 
     /**
      * Returns the given instance id if the current user is authorized to abandon it
-     * 
+     *
      * @param instanceId the job instanceId to abandon
      * @return
      * @throws NoSuchJobInstanceException
@@ -164,7 +165,7 @@ public interface WSBatchAuthService {
 
     /**
      * @param stepExecutionId
-     * 
+     *
      * @throws IllegalArgumentException if the corresponding step execution entry doesn't exist in the persistent store.
      * @throws JobSecurityException f the current user does not have authority to read the given stepExecutionId
      */
@@ -174,5 +175,5 @@ public interface WSBatchAuthService {
      * @param jobList
      * @return
      */
-    public List<WSJobInstance> filterFoundJobInstancesBasedOnGroupSecurity(List<WSJobInstance> jobList);
+    public List<WSJobInstance> filterFoundJobInstancesBasedOnGroupSecurity();
 }

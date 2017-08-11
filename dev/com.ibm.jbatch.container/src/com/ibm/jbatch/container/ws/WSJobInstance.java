@@ -70,5 +70,5 @@ public interface WSJobInstance extends JobInstance {
      */
     List<JobExecutionEntity> getJobExecutions();
 
-    Set<String> getGroupNames();
+    Set<String> getGroupName();
 }

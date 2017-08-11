@@ -22,9 +22,10 @@ import javax.persistence.NamedQueries;
 import javax.persistence.NamedQuery;
 
 @NamedQueries({
-                @NamedQuery(name = JobInstanceEntityV3.GET_ALL_GROUPNAMES_BY_JOBINSTANCE_QUERY, query = "SELECT i.groupNames FROM JobInstanceEntityV3 i WHERE i.instanceId = :jobinstanceID"),
-                @NamedQuery(name = JobInstanceEntityV3.GET_ALL_JOBINSTANCES_BY_GROUPNAME_QUERY, query = "SELECT i FROM JobInstanceEntityV3 i WHERE i.groupNames IN :groups"),
-                @NamedQuery(name = JobInstanceEntityV3.IS_JOB_ACCESSIBLE_BY_ANY_GROUP_QUERY, query = "SELECT i FROM JobInstanceEntityV3 i WHERE i = :jobinstanceid AND i.groupNames IN :groups"),
+                @NamedQuery(name = JobInstanceEntityV3.GET_ALL_GROUPNAMES_BY_JOBINSTANCE_QUERY, query = "SELECT i.groupName FROM JobInstanceEntityV3 i WHERE i.instanceId = :jobinstanceID"),
+                @NamedQuery(name = JobInstanceEntityV3.GET_ALL_JOBINSTANCES_BY_GROUPNAME_QUERY, query = "SELECT i FROM JobInstanceEntityV3 i WHERE i.groupName IN :groups"),
+                @NamedQuery(name = JobInstanceEntityV3.IS_JOB_ACCESSIBLE_BY_ANY_GROUP_QUERY, query = "SELECT i FROM JobInstanceEntityV3 i WHERE i = :jobinstanceid AND i.groupName IN :groups"),
+                @NamedQuery(name = JobInstanceEntityV3.GET_JOBINSTANCES_FIND_BY_SUBMITTER_OR_GROUPACCESS_QUERY, query = "SELECT router FROM JobInstanceEntityV3 router WHERE router.instanceId IN (SELECT DISTINCT v3.instanceId FROM JobInstanceEntityV3 v3 JOIN v3.groupName g WHERE g IN :groups)"),
 })
 
 /**
@@ -36,11 +37,12 @@ public class JobInstanceEntityV3 extends JobInstanceEntityV2 {
     public static final String GET_ALL_GROUPNAMES_BY_JOBINSTANCE_QUERY = "JobInstanceEntityV3.getAllGroupnamesByJobInstanceQuery";
     public static final String GET_ALL_JOBINSTANCES_BY_GROUPNAME_QUERY = "JobInstanceEntityV3.getAllJobInstancesByGroupnameQuery";
     public static final String IS_JOB_ACCESSIBLE_BY_ANY_GROUP_QUERY = "JobInstanceEntityV3.isJobAccessibleByGroupsQuery";
+    public static final String GET_JOBINSTANCES_FIND_BY_SUBMITTER_OR_GROUPACCESS_QUERY = "JobInstanceEntityV3.GET_JOBINSTANCES_FIND_BY_SUBMITTER_OR_GROUPACCESS_QUERY";
 
     @ElementCollection
     @CollectionTable(name = "GROUPASSOCIATION", joinColumns = @JoinColumn(name = "FK_JOBINSTANCEID"))
     @Column(name = "GROUPNAME")
-    private Set<String> groupNames;
+    private Set<String> groupName;
 
     // For JPA
     public JobInstanceEntityV3() {
@@ -52,14 +54,14 @@ public class JobInstanceEntityV3 extends JobInstanceEntityV2 {
         super(jobInstanceId);
     }
 
-    public void setGroupNames(Set<String> opGroupNames) {
+    public void setGroupName(Set<String> opGroupNames) {
 
-        groupNames = opGroupNames;
+        groupName = opGroupNames;
     }
 
     @Override
-    public Set<String> getGroupNames() {
-        return groupNames;
+    public Set<String> getGroupName() {
+        return groupName;
     }
 
 }

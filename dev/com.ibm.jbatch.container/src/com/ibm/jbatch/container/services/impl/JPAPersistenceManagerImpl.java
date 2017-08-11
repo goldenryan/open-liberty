@@ -2531,11 +2531,11 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
 
         EntityManager em = psu.createEntityManager();
         try {
-            // Verify that groupNames column exists by running a query against it.
-            String queryString = "SELECT COUNT(x.groupNames) FROM JobInstanceEntityV3 x";
+            // Verify that groupName column exists by running a query against it.
+            String queryString = "SELECT COUNT(x.groupName) FROM JobInstanceEntityV3 x";
             TypedQuery<Long> query = em.createQuery(queryString, Long.class);
             query.getSingleResult();
-            logger.fine("The groupNames column exists, job instance table version = 3");
+            logger.fine("The groupName column exists, job instance table version = 3");
             instanceVersion = 3;
             return instanceVersion;
         } catch (javax.persistence.PersistenceException e3) {
@@ -2634,29 +2634,23 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
 
     /** {@inheritDoc} */
     @Override
-    public List<Long> getJobIDsForSubjectGroupNames(List<String> listOfGroupsForSubject) {
+    public List<JobInstanceEntity> getJobInstancesForSubjectGroupNames(List<String> listOfGroupsForSubject, String subject) {
         EntityManager em = getPsu().createEntityManager();
         try {
-            TypedQuery<JobInstanceEntityV3> query = em.createNamedQuery(JobInstanceEntityV3.GET_ALL_JOBINSTANCES_BY_GROUPNAME_QUERY,
+            TypedQuery<JobInstanceEntityV3> query = em.createNamedQuery(JobInstanceEntityV3.GET_JOBINSTANCES_FIND_BY_SUBMITTER_OR_GROUPACCESS_QUERY,
                                                                         JobInstanceEntityV3.class);
             query.setParameter("groups", listOfGroupsForSubject);
+            //query.setParameter("submitterName", subject);
             List<JobInstanceEntityV3> rows = query.getResultList();
 
             if (rows.isEmpty()) {
                 throw new NoSuchJobInstanceException("No jobInstances found for groups = " + listOfGroupsForSubject.toString());
             }
 
-            JobInstanceEntityV3 jobInstance;
-            List<Long> jobInstanceIDs = new ArrayList<Long>();
+            JobInstanceEntity jobInstance;
+            List<JobInstanceEntity> jobInstances = new ArrayList<JobInstanceEntity>(rows);
 
-            Iterator it = rows.iterator();
-            while (it.hasNext()) {
-                jobInstance = (JobInstanceEntityV3) it.next();
-                long jobInstanceID = jobInstance.getInstanceId();
-                jobInstanceIDs.add(jobInstanceID);
-            }
-
-            return jobInstanceIDs;
+            return jobInstances;
         } finally {
             em.close();
         }
@@ -2678,7 +2672,7 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
                         throw new NoSuchJobInstanceException("No job instance found for id = " + jobInstanceID);
                     }
 
-                    instance.setGroupNames(groupNames);
+                    instance.setGroupName(groupNames);
 
                     entityMgr.merge(instance);
                     return instance;

@@ -120,7 +120,7 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
         return (securityService != null) ? securityService.getAuthorizationService() : null;
     }
 
-    @Reference
+    @Reference(cardinality = ReferenceCardinality.OPTIONAL)
     protected void setBatchGroupSecurityHelper(BatchGroupSecurityHelper batchGroupSecurityHelper) {
         this.batchGroupSecurityHelper = batchGroupSecurityHelper;
     }
@@ -164,33 +164,65 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
         String submitter = persistenceManagerService.getJobInstanceSubmitter(instanceId);
         List<String> listOfGroupsForJobID = null;
         List<String> listOfGroupsForSubject = null;
+        boolean checkGroupSecurity = false;
 
         if (this.isAdmin(runAsSubject())) {
         } else if (this.isMonitor(runAsSubject())) {
-        } else if ((this.isGroupAdmin(runAsSubject()) || (this.isGroupMonitor(runAsSubject())))) {
+        } else if (this.isSubmitter(runAsSubject())) {
+        	boolean submitterRole = this.isSubmitter(runAsSubject());
+        	boolean isGroupAdmin = this.isGroupAdmin();
+        	boolean isGroupMonitor = this.isGroupMonitor();
+            //if you don't also own the job you can't view it
+			if (batchSecurityHelper.getRunAsUser().equals(submitter)) {
+			} else if (this.isGroupAdmin() || this.isGroupMonitor()) {
+				checkGroupSecurity = true;
+			} else {
+
+				throw new JobSecurityException(getFormattedMessage("USER_UNAUTHORIZED_JOB_INSTANCE",
+						new Object[] { getRunAsUser(), instanceId },
+						"CWWKY0302W: User {0} is not authorized to perform batch operations associated with job instance {1}."));
+			}
+        } else if (this.isGroupAdmin() || this.isGroupMonitor()) { 
+    		checkGroupSecurity = true;
+    	}
+        else {
+            throw new JobSecurityException( getFormattedMessage( "USER_UNAUTHORIZED_NO_BATCH_ROLES",
+                                                                 new Object[] { getRunAsUser() },
+                                                                 "CWWKY0303W: User {0} is not authorized to perform any batch operations." ) );
+        }
+        	      	
+        if (checkGroupSecurity) {
 			try {	
-				listOfGroupsForJobID = persistenceManagerService.getGroupNamesForJobID(instanceId);
-				listOfGroupsForSubject = getSubjectGroups(runAsSubject());
-				// if (!listOfGroupsForJobID.isEmpty()) { //there are groups
-				// associated with this jobID
-				if (subjectInGroups(listOfGroupsForSubject, listOfGroupsForJobID)) {
-					// allow access
-					logger.finer("group security: access would be allowed");
-					// leaving here to return  the instanceId at the end of this method...
+				if (!this.isGroupAdmin()) {
+					throw new JobSecurityException(getFormattedMessage("USER_UNAUTHORIZED_JOB_INSTANCE",
+							new Object[] { getRunAsUser(), instanceId },
+							"CWWKY0302W: User {0} is not authorized to perform batch operations associated with job instance {1}."));
 				} else {
-					// user not in any groups listed - disallow access
-					// construct message to be displayed
-					logger.finer("group security: subject not in the group(s) found - disallow access");
-					
-					String log_jobGroups = constructGroupListForAuthFailString(listOfGroupsForJobID);
-					
-					logger.fine(log_jobGroups);
-					logger.fine(getFormattedMessage("USER_GROUP_UNAUTHORIZED_JOB_INSTANCE",
-							new Object[] {instanceId, getRunAsUser(), constructGroupListForAuthFailString(listOfGroupsForJobID)},
-							"CWWKY0305W: Access to job instance {0} denied.  The job has an operation group name defined and the user {1} has batchGroupMonitor or batchGroupAdmin authority but is not a member of the any appropriate group {2}."));
-					throw new JobSecurityException( getFormattedMessage( "USER_UNAUTHORIZED_NO_BATCH_ROLES",
-                            new Object[] { getRunAsUser() },
-                            "CWWKY0303W: User {0} is not authorized to perform any batch operations." ) );
+					listOfGroupsForJobID = persistenceManagerService.getGroupNamesForJobID(instanceId);
+					listOfGroupsForSubject = getSubjectGroups(runAsSubject());
+					// if (!listOfGroupsForJobID.isEmpty()) { //there are groups
+					// associated with this jobID
+					if (subjectInGroups(listOfGroupsForSubject, listOfGroupsForJobID)) {
+						// allow access
+						logger.finer("group security: access would be allowed");
+						// leaving here to return the instanceId at the end of
+						// this method...
+					} else {
+						// user not in any groups listed - disallow access
+						// construct message to be displayed
+						logger.finer("group security: subject not in the group(s) found - disallow access");
+
+						String log_jobGroups = constructGroupListForAuthFailString(listOfGroupsForJobID);
+
+						logger.fine(log_jobGroups);
+						logger.fine(getFormattedMessage("USER_GROUP_UNAUTHORIZED_JOB_INSTANCE",
+								new Object[] { instanceId, getRunAsUser(),
+										constructGroupListForAuthFailString(listOfGroupsForJobID) },
+								"CWWKY0305W: Access to job instance {0} denied.  The job has an operation group name defined and the user {1} has batchGroupMonitor or batchGroupAdmin authority but is not a member of the any appropriate group {2}."));
+						throw new JobSecurityException(
+								getFormattedMessage("USER_UNAUTHORIZED_NO_BATCH_ROLES", new Object[] { getRunAsUser() },
+										"CWWKY0303W: User {0} is not authorized to perform any batch operations."));
+					}
 				}
         	} catch (NoSuchJobInstanceException nsjex) {
         		//no groups associated with jobid - disallow access
@@ -199,19 +231,8 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
                         new Object[] { getRunAsUser() },
                         "CWWKY0303W: User {0} is not authorized to perform any batch operations." ) );
         	}
-        } else if (this.isSubmitter(runAsSubject())) {
-            //if you don't also own the job you can't view it
-            if (!batchSecurityHelper.getRunAsUser().equals(submitter)){
-                throw new JobSecurityException( getFormattedMessage( "USER_UNAUTHORIZED_JOB_INSTANCE",
-                                                                     new Object[] {getRunAsUser(), instanceId},
-                                                                     "CWWKY0302W: User {0} is not authorized to perform batch operations associated with job instance {1}.") );
-            }
-        } else {
-            throw new JobSecurityException( getFormattedMessage( "USER_UNAUTHORIZED_NO_BATCH_ROLES",
-                                                                 new Object[] { getRunAsUser() },
-                                                                 "CWWKY0303W: User {0} is not authorized to perform any batch operations." ) );
-        }
-
+        } 
+        
         return instanceId;
     }
 
@@ -230,7 +251,12 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
 	}
 
 	private List<String> getSubjectGroups(Subject runAsSubject) {
-		return batchGroupSecurityHelper.getGroupsForSubject(runAsSubject);
+		if (batchGroupSecurityHelper != null){
+			return batchGroupSecurityHelper.getGroupsForSubject(runAsSubject);
+		}
+		else {
+			return new ArrayList<String>();
+		}
 	}
     /**
      * {@inheritDoc}
@@ -256,7 +282,6 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
     @Override
     public void authorizedJobSubmission() throws JobSecurityException {
         if (this.isAdmin(runAsSubject())) {
-        } else if (this.isGroupAdmin(runAsSubject())) {
         } else if (this.isSubmitter(runAsSubject())) {
         } else {
             throw new JobSecurityException( getFormattedMessage( "USER_UNAUTHORIZED_TO_START_JOB",
@@ -324,6 +349,13 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
     	List<String> listOfGroupsForSubject = null;
     	if (this.isAdmin(runAsSubject())) {
     		logger.finer("Current user " + this.getRunAsUser()+ " is admin, so always authorized");
+    	} else if (this.isSubmitter(runAsSubject())) {
+    		//if you don't also own the job you can't stop or restart it
+    		if (!batchSecurityHelper.getRunAsUser().equals(submitter)){
+    			throw new JobSecurityException( getFormattedMessage( "USER_UNAUTHORIZED_JOB_INSTANCE",
+    																new Object[] {getRunAsUser(), instanceId},
+    																"CWWKY0302W: User {0} is not authorized to perform batch operations associated with job instance {1}.") );
+    		}
     	} else if (this.isGroupAdmin(runAsSubject())) {
 			try {	
 				listOfGroupsForJobID = persistenceManagerService.getGroupNamesForJobID(instanceId);
@@ -333,8 +365,9 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
 				if (subjectInGroups(listOfGroupsForSubject, listOfGroupsForJobID)) {
 					// allow access
 					logger.finer("group security: access would be allowed");
+					
 				} else {
-					// user not in any groups listed - disallow access
+					// user not the submitter and is not in any groups listed - disallow access
 					logger.fine(getFormattedMessage("USER_GROUP_UNAUTHORIZED_JOB_INSTANCE",
 							new Object[] {instanceId, getRunAsUser(), constructGroupListForAuthFailString(listOfGroupsForJobID)},
 							"CWWKY0305W: Access to job instance {1} denied.  The job has an operation group name defined and the user {2} has batchGroupMonitor or batchGroupAdmin authority but is not a member of the any appropriate group {3}."));
@@ -349,14 +382,7 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
                         new Object[] { getRunAsUser() },
                         "CWWKY0303W: User {0} is not authorized to perform any batch operations." ) );
         	}
-    	} else if (this.isSubmitter(runAsSubject())) {
-    		//if you don't also own the job you can't stop or restart it
-    		if (!batchSecurityHelper.getRunAsUser().equals(submitter)){
-    			throw new JobSecurityException( getFormattedMessage( "USER_UNAUTHORIZED_JOB_INSTANCE",
-    																new Object[] {getRunAsUser(), instanceId},
-    																"CWWKY0302W: User {0} is not authorized to perform batch operations associated with job instance {1}.") );
-    		}
-    	}else if (this.isMonitor(runAsSubject())) {
+    	} else if (this.isMonitor(runAsSubject())) {
     		throw new JobSecurityException("Current user " + this.getRunAsUser()+ " with role batch_monitor is not authorized to stop or restart jobs.");
     	}else if (this.isGroupMonitor(runAsSubject())) {
     		throw new JobSecurityException("Current user " + this.getRunAsUser()+ " with role group_batch_monitor is not authorized to stop or restart jobs.");
@@ -391,10 +417,14 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
     		if (this.isAdmin()) {
     			logger.finer("Current user " + this.getRunAsUser()+ " is admin, so always authorized");
     		}
+    		else if (this.isSubmitter() && !this.isGroupAdmin()){
+    			if (!getRunAsUser().equals(submitter)){
+    				unAuthFlag = true;
+    			}
+    		}
     		else if (this.isGroupAdmin()) {
 				try {
 					listOfGroupsForJobID = persistenceManagerService.getGroupNamesForJobID(instanceId);
-
 					listOfGroupsForSubject = getSubjectGroups(runAsSubject());
 					if (!listOfGroupsForJobID.isEmpty()) { // there are groups
 															// associated with
@@ -412,11 +442,6 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
 					unAuthFlag = true;
 				}
     		} 
-    		else if (getRunAsUser().equals(submitter)) { 
-    			if (!this.isSubmitter()) {
-    				unAuthFlag = true;
-    			} 
-    		}
     		else {
     			unAuthFlag = true;
     		}
@@ -428,7 +453,7 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
 
     		return instanceId;
 
-    	}else {
+    	} else {
     		throw new JobSecurityException( getFormattedMessage( "USER_UNAUTHORIZED_NO_BATCH_ROLES",
     				new Object[] { getRunAsUser() },
     				"CWWKY0303W: User {0} is not authorized to perform any batch operations." ) );
@@ -628,30 +653,22 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
     }
 
 	@Override
-	public List<WSJobInstance> filterFoundJobInstancesBasedOnGroupSecurity(List<WSJobInstance> jobList) {
+	public List<WSJobInstance> filterFoundJobInstancesBasedOnGroupSecurity() {
 		
 		List<String> listOfGroupsForSubject = null;
 		List<Long> jobInstanceIDsForSubjectGroupNames = null;
-		List<WSJobInstance> filteredJobInstancesByGroupAccess = new ArrayList<WSJobInstance>();
+		List<WSJobInstance> filteredJobInstancesByGroupAccess = null;
 
 		listOfGroupsForSubject = getSubjectGroups(runAsSubject());
 		if (!listOfGroupsForSubject.isEmpty()) {
 			try {
-				jobInstanceIDsForSubjectGroupNames = persistenceManagerService.getJobIDsForSubjectGroupNames(listOfGroupsForSubject);
-				if (!jobInstanceIDsForSubjectGroupNames.isEmpty()) {
-					Iterator it = jobList.iterator();
-					while (it.hasNext()) {
-						WSJobInstance checkJobInstanceID = (WSJobInstance) it.next();
-						Long jobInstanceID = checkJobInstanceID.getInstanceId();
-
-						if (jobInstanceIDsForSubjectGroupNames.contains(jobInstanceID)) {
-							filteredJobInstancesByGroupAccess.add(checkJobInstanceID);
-						}
-					}
-				}
+				filteredJobInstancesByGroupAccess = new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstancesForSubjectGroupNames(listOfGroupsForSubject, getRunAsUser()));
 			} catch (NoSuchJobInstanceException nsjex) {
 				logger.finer("group security: no jobInstanceIDs found for associated with subject: " + getRunAsUser() + " groupnames: " + constructGroupListForAuthFailString(listOfGroupsForSubject));
 			}
+		}
+		else {
+			filteredJobInstancesByGroupAccess = new ArrayList<WSJobInstance>();
 		}
 		return filteredJobInstancesByGroupAccess;
 	}
