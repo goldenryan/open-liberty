@@ -128,12 +128,16 @@ public class WSJobRepositoryImpl implements WSJobRepository {
     @Override
     public List<WSJobInstance> getJobInstances(int page, int pageSize) {
 
+        List<String> listOfGroupsForJobID = null;
         //Return the whole list for an admin or monitor
         if (authService == null || authService.isAdmin() || authService.isMonitor()) {
             return new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(page, pageSize));
         } else if (authService.isSubmitter()) {
             //filter based on current user if not admin or monitor
             return new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(page, pageSize, authService.getRunAsUser()));
+        } else if (authService.isGroupAdmin() || authService.isGroupMonitor()) {
+            List<WSJobInstance> jobList = new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(page, pageSize));
+            return authService.filterFoundJobInstancesBasedOnGroupSecurity(jobList);
         }
 
         throw new JobSecurityException("The current user " + batchSecurityHelper.getRunAsUser() + " is not authorized to perform any batch operations.");
@@ -148,6 +152,9 @@ public class WSJobRepositoryImpl implements WSJobRepository {
 
         if (authService == null || authService.isAdmin() || authService.isMonitor()) {
             return new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(queryHelper, page, pageSize));
+        } else if (authService.isGroupAdmin() || authService.isGroupMonitor()) {
+            List<WSJobInstance> jobList = new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(queryHelper, page, pageSize));
+            return authService.filterFoundJobInstancesBasedOnGroupSecurity(jobList);
         } else if (authService.isSubmitter()) {
             queryHelper.setAuthSubmitter(authService.getRunAsUser());
             return new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(queryHelper, page, pageSize));
@@ -383,5 +390,10 @@ public class WSJobRepositoryImpl implements WSJobRepository {
     @Override
     public int getJobInstanceTableVersion() throws Exception {
         return persistenceManagerService.getJobInstanceTableVersion();
+    }
+
+    @Override
+    public WSJobInstance updateJobInstanceWithGroupNames(long jobInstanceId, Set<String> groupNames) {
+        return persistenceManagerService.updateJobInstanceWithGroupNames(jobInstanceId, groupNames);
     }
 }
