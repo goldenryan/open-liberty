@@ -16,7 +16,6 @@
  */
 package com.ibm.jbatch.container.services;
 
-import java.util.Collection;
 import java.util.Date;
 import java.util.List;
 import java.util.Properties;
@@ -48,8 +47,6 @@ import com.ibm.jbatch.container.persistence.jpa.TopLevelStepInstanceEntity;
 import com.ibm.jbatch.container.persistence.jpa.TopLevelStepInstanceKey;
 import com.ibm.jbatch.container.ws.InstanceState;
 import com.ibm.jbatch.container.ws.RemotablePartitionState;
-import com.ibm.jbatch.container.ws.WSJobInstance;
-import com.ibm.jbatch.container.ws.WSSearchObject;
 import com.ibm.jbatch.container.ws.WSStepThreadExecutionAggregate;
 import com.ibm.jbatch.spi.services.IBatchServiceBase;
 
@@ -576,7 +573,7 @@ public interface IPersistenceManagerService extends IBatchServiceBase {
      * @param pageSize
      * @return
      */
-    public Collection<? extends WSJobInstance> getJobInstancesWithGroupSecurity(WSSearchObject wsso, int page, int pageSize);
+    //public Collection<? extends WSJobInstance> getJobInstancesWithGroupSecurity(WSSearchObject wsso, int page, int pageSize);
 
     /**
      * @param listOfGroupsForSubject

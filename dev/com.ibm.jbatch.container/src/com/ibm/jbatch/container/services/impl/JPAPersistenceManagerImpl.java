@@ -13,7 +13,6 @@ package com.ibm.jbatch.container.services.impl;
 import java.io.Writer;
 import java.sql.SQLSyntaxErrorException;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -77,9 +76,8 @@ import com.ibm.jbatch.container.util.WSStepThreadExecutionAggregateImpl;
 import com.ibm.jbatch.container.ws.BatchLocationService;
 import com.ibm.jbatch.container.ws.InstanceState;
 import com.ibm.jbatch.container.ws.RemotablePartitionState;
-import com.ibm.jbatch.container.ws.WSJobInstance;
 import com.ibm.jbatch.container.ws.WSPartitionStepThreadExecution;
-import com.ibm.jbatch.container.ws.WSSearchObject;
+//import com.ibm.jbatch.container.ws.WSSearchObject;
 import com.ibm.jbatch.container.ws.WSStepThreadExecutionAggregate;
 import com.ibm.jbatch.container.ws.impl.WSStartupRecoveryServiceImpl;
 import com.ibm.jbatch.spi.services.IBatchConfig;
@@ -2626,11 +2624,11 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
     }
 
     /** {@inheritDoc} */
-    @Override
-    public Collection<? extends WSJobInstance> getJobInstancesWithGroupSecurity(WSSearchObject wsso, int page, int pageSize) {
-        // TODO Auto-generated method stub
-        return null;
-    }
+//    @Override
+//    public Collection<? extends WSJobInstance> getJobInstancesWithGroupSecurity(WSSearchObject wsso, int page, int pageSize) {
+//        // TODO Auto-generated method stub
+//        return null;
+//    }
 
     /** {@inheritDoc} */
     @Override
