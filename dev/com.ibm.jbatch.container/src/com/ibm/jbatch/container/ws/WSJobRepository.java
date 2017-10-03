@@ -282,4 +282,6 @@ public interface WSJobRepository {
      */
     int getJobInstanceTableVersion() throws Exception;
 
+    public WSJobInstance updateJobInstanceWithGroupNames(long jobInstanceId, Set<String> groupNames);
+
 }

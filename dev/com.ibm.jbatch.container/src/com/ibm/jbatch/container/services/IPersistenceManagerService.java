@@ -553,4 +553,33 @@ public interface IPersistenceManagerService extends IBatchServiceBase {
      */
     String getPersistenceType();
 
+    /**
+     *
+     * @param jobInstanceID
+     * @return list of group names if any exist
+     */
+    public List<String> getGroupNamesForJobID(long jobInstanceID) throws NoSuchJobInstanceException;
+
+    /**
+     *
+     * @param jobInstanceID
+     * @return list of group names if any exist
+     */
+    public boolean isJobIDAccessibleByAnyGroupName(long jobInstanceID, List<String> subjectGroups) throws NoSuchJobInstanceException;
+
+    /**
+     * @param wsso
+     * @param page
+     * @param pageSize
+     * @return
+     */
+    //public Collection<? extends WSJobInstance> getJobInstancesWithGroupSecurity(WSSearchObject wsso, int page, int pageSize);
+
+    /**
+     * @param listOfGroupsForSubject
+     * @return
+     */
+    public List<JobInstanceEntity> getJobInstancesForSubjectGroupNames(List<String> listOfGroupsForSubject, String subj);
+
+    public JobInstanceEntity updateJobInstanceWithGroupNames(long jobInstanceId, Set<String> groupName);
 }

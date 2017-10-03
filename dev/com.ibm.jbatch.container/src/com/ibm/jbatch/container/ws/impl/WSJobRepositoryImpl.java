@@ -128,9 +128,14 @@ public class WSJobRepositoryImpl implements WSJobRepository {
     @Override
     public List<WSJobInstance> getJobInstances(int page, int pageSize) {
 
+        List<WSJobInstance> filteredJobList = new ArrayList<WSJobInstance>();
+
         //Return the whole list for an admin or monitor
         if (authService == null || authService.isAdmin() || authService.isMonitor()) {
             return new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(page, pageSize));
+        } else if (authService.isGroupAdmin() || authService.isGroupMonitor()) {
+            filteredJobList = authService.filterFoundJobInstancesBasedOnGroupSecurity();
+            return filteredJobList;
         } else if (authService.isSubmitter()) {
             //filter based on current user if not admin or monitor
             return new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(page, pageSize, authService.getRunAsUser()));
@@ -148,6 +153,8 @@ public class WSJobRepositoryImpl implements WSJobRepository {
 
         if (authService == null || authService.isAdmin() || authService.isMonitor()) {
             return new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(queryHelper, page, pageSize));
+        } else if (authService.isGroupAdmin() || authService.isGroupMonitor()) {
+            return authService.filterFoundJobInstancesBasedOnGroupSecurity();
         } else if (authService.isSubmitter()) {
             queryHelper.setAuthSubmitter(authService.getRunAsUser());
             return new ArrayList<WSJobInstance>(persistenceManagerService.getJobInstances(queryHelper, page, pageSize));
@@ -383,5 +390,10 @@ public class WSJobRepositoryImpl implements WSJobRepository {
     @Override
     public int getJobInstanceTableVersion() throws Exception {
         return persistenceManagerService.getJobInstanceTableVersion();
+    }
+
+    @Override
+    public WSJobInstance updateJobInstanceWithGroupNames(long jobInstanceId, Set<String> groupNames) {
+        return persistenceManagerService.updateJobInstanceWithGroupNames(jobInstanceId, groupNames);
     }
 }

@@ -15,6 +15,7 @@ import java.sql.SQLSyntaxErrorException;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -60,6 +61,7 @@ import com.ibm.jbatch.container.persistence.jpa.JobExecutionEntity;
 import com.ibm.jbatch.container.persistence.jpa.JobExecutionEntityV2;
 import com.ibm.jbatch.container.persistence.jpa.JobInstanceEntity;
 import com.ibm.jbatch.container.persistence.jpa.JobInstanceEntityV2;
+import com.ibm.jbatch.container.persistence.jpa.JobInstanceEntityV3;
 import com.ibm.jbatch.container.persistence.jpa.RemotablePartitionEntity;
 import com.ibm.jbatch.container.persistence.jpa.RemotablePartitionKey;
 import com.ibm.jbatch.container.persistence.jpa.StepThreadExecutionEntity;
@@ -75,6 +77,7 @@ import com.ibm.jbatch.container.ws.BatchLocationService;
 import com.ibm.jbatch.container.ws.InstanceState;
 import com.ibm.jbatch.container.ws.RemotablePartitionState;
 import com.ibm.jbatch.container.ws.WSPartitionStepThreadExecution;
+//import com.ibm.jbatch.container.ws.WSSearchObject;
 import com.ibm.jbatch.container.ws.WSStepThreadExecutionAggregate;
 import com.ibm.jbatch.container.ws.impl.WSStartupRecoveryServiceImpl;
 import com.ibm.jbatch.spi.services.IBatchConfig;
@@ -156,7 +159,7 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
      * Most current versions of entities.
      */
     private static final int MAX_EXECUTION_VERSION = 2;
-    private static final int MAX_INSTANCE_VERSION = 2;
+    private static final int MAX_INSTANCE_VERSION = 3;
 
     /**
      * Declarative Services method for setting the Liberty executor.
@@ -289,8 +292,10 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
      */
     @SuppressWarnings("rawtypes")
     private Class getJobInstanceEntityClass(int jobInstanceVersion) {
-        if (jobInstanceVersion >= 2) {
+        if (jobInstanceVersion == 2) {
             return JobInstanceEntityV2.class;
+        } else if (jobInstanceVersion >= 3) {
+            return JobInstanceEntityV3.class;
         } else {
             return JobInstanceEntity.class;
         }
@@ -311,8 +316,8 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
 
         // If any tables are not up to the current code level, re-load the PSU with backleveled entities.
         int instanceVersion = getJobInstanceTableVersion(retMe);
-        if (instanceVersion < 2) {
-            logger.fine("The UPDATETIME column could not be found. The persistence service unit will exclude the V2 instance entity.");
+        if (instanceVersion < 3) {
+            logger.fine("The GROUPNAMES column could not be found. The persistence service unit will exclude the V3 instance entity.");
             retMe.close();
             retMe = createPsu(instanceVersion, MAX_EXECUTION_VERSION);
         }
@@ -372,8 +377,10 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
                 @Override
                 public JobInstanceEntity call() {
                     JobInstanceEntity jobInstance;
-                    if (instanceVersion >= 2) {
+                    if (instanceVersion == 2) {
                         jobInstance = new JobInstanceEntityV2();
+                    } else if (instanceVersion >= 3) {
+                        jobInstance = new JobInstanceEntityV3();
                     } else {
                         jobInstance = new JobInstanceEntity();
                     }
@@ -2215,15 +2222,20 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
     @Override
     public boolean purgeJobInstanceAndRelatedData(long jobInstanceId) {
         EntityManager em = getPsu().createEntityManager();
+        final JobInstanceEntity instance;
         try {
-            final JobInstanceEntity instance = em.find(JobInstanceEntity.class, jobInstanceId);
+            if (instanceVersion == 3) {
+                instance = em.find(JobInstanceEntityV3.class, jobInstanceId);
+            } else
+                instance = em.find(JobInstanceEntity.class, jobInstanceId);
+
             if (instance == null) {
                 throw new NoSuchJobInstanceException("No job instance found for id = " + jobInstanceId);
             }
             new TranRequest<Void>(em) {
                 @Override
                 public Void call() {
-                    entityMgr.remove(instance);
+                    entityMgr.remove((JobInstanceEntity) instance);
                     return null;
                 }
             }.runInNewOrExistingGlobalTran();
@@ -2517,30 +2529,156 @@ public class JPAPersistenceManagerImpl extends AbstractPersistenceManager implem
 
         EntityManager em = psu.createEntityManager();
         try {
-            // Verify that UPDATETIME column exists by running a query against it.
-            String queryString = "SELECT COUNT(x.lastUpdatedTime) FROM JobInstanceEntityV2 x";
+            // Verify that groupName column exists by running a query against it.
+            String queryString = "SELECT COUNT(x.groupName) FROM JobInstanceEntityV3 x";
             TypedQuery<Long> query = em.createQuery(queryString, Long.class);
             query.getSingleResult();
-            logger.fine("The UPDATETIME column exists, job instance table version = 2");
-            instanceVersion = 2;
+            logger.fine("The groupName column exists, job instance table version = 3");
+            instanceVersion = 3;
             return instanceVersion;
-        } catch (javax.persistence.PersistenceException e) {
-            Throwable cause = e.getCause();
+        } catch (javax.persistence.PersistenceException e3) {
+            Throwable cause = e3.getCause();
             while (cause != null) {
                 if (cause instanceof SQLSyntaxErrorException &&
                     cause.getMessage() != null &&
-                    cause.getMessage().contains("UPDATETIME")) {
+                    cause.getMessage().contains("GROUPNAMES")) {
                     // The column isn't there.
-                    logger.fine("The UPDATETIME column does not exist, job instance table version = 1");
-                    instanceVersion = 1;
-                    return instanceVersion;
+                    try {
+                        // Verify that UPDATETIME column exists by running a query against it.
+                        String queryString = "SELECT COUNT(x.lastUpdatedTime) FROM JobInstanceEntityV2 x";
+                        TypedQuery<Long> query = em.createQuery(queryString, Long.class);
+                        query.getSingleResult();
+                        logger.fine("The UPDATETIME column exists, job instance table version = 2");
+                        instanceVersion = 2;
+                        return instanceVersion;
+                    } catch (javax.persistence.PersistenceException e2) {
+                        cause = e2.getCause();
+                        while (cause != null) {
+                            if (cause instanceof SQLSyntaxErrorException &&
+                                cause.getMessage() != null &&
+                                cause.getMessage().contains("UPDATETIME")) {
+                                // The column isn't there.
+                                logger.fine("The UPDATETIME column does not exist, job instance table version = 1");
+                                instanceVersion = 1;
+                                return instanceVersion;
+                            }
+                            cause = cause.getCause();
+                        }
+                    }
                 }
-                cause = cause.getCause();
             }
             logger.fine("Unexpected exception while checking job instance table version, re-throwing");
-            throw e;
+            throw e3;
         } finally {
             em.close();
         }
     }
+
+    @Override
+    public List<String> getGroupNamesForJobID(long jobInstanceID) throws NoSuchJobInstanceException {
+        EntityManager em = getPsu().createEntityManager();
+        try {
+            TypedQuery<JobInstanceEntityV3> query = em.createNamedQuery(JobInstanceEntityV3.GET_ALL_GROUPNAMES_BY_JOBINSTANCE_QUERY,
+                                                                        JobInstanceEntityV3.class);
+            query.setParameter("jobinstanceID", jobInstanceID);
+            List<JobInstanceEntityV3> rows = query.getResultList();
+
+            if (rows.isEmpty()) {
+                throw new NoSuchJobInstanceException("No job execution found for id = " + jobInstanceID);
+            }
+
+            //GroupAssociationStateEntity groupjobid = new GroupAssociationStateEntity();
+            List<String> groups = new ArrayList<String>();
+
+            Iterator it = rows.iterator();
+            String aGroupName;
+            while (it.hasNext()) {
+                aGroupName = (String) it.next();
+                groups.add(aGroupName);
+            }
+            return groups;
+        } finally {
+            em.close();
+        }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean isJobIDAccessibleByAnyGroupName(long jobInstanceID, List<String> subjectGroups) throws NoSuchJobInstanceException {
+        EntityManager em = getPsu().createEntityManager();
+        try {
+            TypedQuery<JobInstanceEntityV3> query = em.createNamedQuery(JobInstanceEntityV3.IS_JOB_ACCESSIBLE_BY_ANY_GROUP_QUERY,
+                                                                        JobInstanceEntityV3.class);
+            query.setParameter("jobinstanceid", jobInstanceID);
+            query.setParameter("groups", subjectGroups);
+
+            boolean notFound = query.setMaxResults(1).getResultList().isEmpty();
+            if (notFound) //the query did not find anything - the resulting list is empty
+                return false;
+            else
+                return true; //the resulting list contains something that satisfied the query - we don't care what it is, just that there is at least one record present
+
+        } finally {
+            em.close();
+        }
+    }
+
+    /** {@inheritDoc} */
+//    @Override
+//    public Collection<? extends WSJobInstance> getJobInstancesWithGroupSecurity(WSSearchObject wsso, int page, int pageSize) {
+//        // TODO Auto-generated method stub
+//        return null;
+//    }
+
+    /** {@inheritDoc} */
+    @Override
+    public List<JobInstanceEntity> getJobInstancesForSubjectGroupNames(List<String> listOfGroupsForSubject, String subject) {
+        EntityManager em = getPsu().createEntityManager();
+        try {
+            TypedQuery<JobInstanceEntityV3> query = em.createNamedQuery(JobInstanceEntityV3.GET_JOBINSTANCES_FIND_BY_SUBMITTER_OR_GROUPACCESS_QUERY,
+                                                                        JobInstanceEntityV3.class);
+            query.setParameter("groups", listOfGroupsForSubject);
+            //query.setParameter("submitterName", subject);
+            List<JobInstanceEntityV3> rows = query.getResultList();
+
+            if (rows.isEmpty()) {
+                throw new NoSuchJobInstanceException("No jobInstances found for groups = " + listOfGroupsForSubject.toString());
+            }
+
+            JobInstanceEntity jobInstance;
+            List<JobInstanceEntity> jobInstances = new ArrayList<JobInstanceEntity>(rows);
+
+            return jobInstances;
+        } finally {
+            em.close();
+        }
+    }
+
+    @Override
+    public JobInstanceEntity updateJobInstanceWithGroupNames(final long jobInstanceID, final Set<String> groupNames) {
+
+        EntityManager em = getPsu().createEntityManager();
+
+        try {
+            return new TranRequest<JobInstanceEntityV3>(em) {
+                @Override
+                public JobInstanceEntityV3 call() {
+
+                    JobInstanceEntityV3 instance = entityMgr.find(JobInstanceEntityV3.class, jobInstanceID);
+
+                    if (instance == null) {
+                        throw new NoSuchJobInstanceException("No job instance found for id = " + jobInstanceID);
+                    }
+
+                    instance.setGroupName(groupNames);
+
+                    entityMgr.merge(instance);
+                    return instance;
+                }
+            }.runInNewOrExistingGlobalTran();
+        } finally {
+            em.close();
+        }
+    }
+
 }
