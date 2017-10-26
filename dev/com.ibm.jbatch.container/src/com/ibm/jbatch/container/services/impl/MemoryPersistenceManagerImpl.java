@@ -73,6 +73,7 @@ import com.ibm.jbatch.container.ws.BatchLocationService;
 import com.ibm.jbatch.container.ws.InstanceState;
 import com.ibm.jbatch.container.ws.RemotablePartitionState;
 import com.ibm.jbatch.container.ws.WSPartitionStepThreadExecution;
+//import com.ibm.jbatch.container.ws.WSSearchObject;
 import com.ibm.jbatch.container.ws.WSStepThreadExecutionAggregate;
 import com.ibm.jbatch.container.ws.WSTopLevelStepExecution;
 import com.ibm.jbatch.spi.services.IBatchConfig;
@@ -1382,6 +1383,40 @@ public class MemoryPersistenceManagerImpl extends AbstractPersistenceManager imp
     @Override
     public String getPersistenceType() {
         return "MEM";
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public List<String> getGroupNamesForJobID(long jobInstanceID) throws NoSuchJobInstanceException {
+        // TODO Auto-generated method stub
+        return null;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public boolean isJobIDAccessibleByAnyGroupName(long jobInstanceID, List<String> subjectGroups) throws NoSuchJobInstanceException {
+        // TODO Auto-generated method stub
+        return false;
+    }
+
+    /** {@inheritDoc} */
+//    @Override
+//    public Collection<? extends WSJobInstance> getJobInstancesWithGroupSecurity(WSSearchObject wsso, int page, int pageSize) {
+    // TODO Auto-generated method stub
+//        return null;
+//    }
+
+    /** {@inheritDoc} */
+    @Override
+    public List<JobInstanceEntity> getJobInstancesForSubjectGroupNames(List<String> listOfGroupsForSubject, String subject) {
+        // TODO Auto-generated method stub
+        return null;
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public JobInstanceEntity updateJobInstanceWithGroupNames(long jobInstanceId, Set<String> groupNames) {
+        return null;
     }
 
 }
