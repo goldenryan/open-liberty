@@ -17,13 +17,16 @@ src: \
 	test-applications/BeanValidationTests/src,\
 	test-applications/JSF22FacesFlows/src,\
 	test-applications/JSF22CDIFacesFlows/src,\
-	test-applications/JSF22StatelessView/src
+	test-applications/JSF22StatelessView/src,\
+	test-applications/noJsfApp/src
 
 test.project: true
 
 -buildpath: \
 	com.ibm.websphere.javaee.annotation.1.2;version=latest,\
+	com.ibm.websphere.javaee.concurrent.1.0;version=latest,\
 	com.ibm.websphere.javaee.cdi.1.2;version=latest,\
+	com.ibm.websphere.javaee.ejb.3.2;version=latest,\
 	com.ibm.websphere.javaee.el.3.0;version=latest,\
 	com.ibm.websphere.javaee.interceptor.1.2;version=latest,\
 	com.ibm.websphere.javaee.jsf.2.2;version=latest,\

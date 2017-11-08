@@ -672,4 +672,11 @@ public class WSBatchAuthServiceImpl implements WSBatchAuthService {
 		}
 		return filteredJobInstancesByGroupAccess;
 	}
+	
+	@Override
+	public List<String> getGroupsForSubject() {		
+
+		return getSubjectGroups(runAsSubject());
+		
+	}
 }

@@ -41,7 +41,8 @@ addRequiredLibraries {
 			        'commons-digester:commons-digester:1.8',
 			        'commons-collections:commons-collections:3.2.1',
 			        'commons-logging:commons-logging:1.1.3',
-			        'commons-beanutils:commons-beanutils:1.8.3'
+			        'commons-beanutils:commons-beanutils:1.8.3',
+			        'com.ibm.ws.javax.j2ee:persistence:2.1'
 		}
 		copy {
 			from configurations.mojarra
@@ -54,12 +55,6 @@ addRequiredLibraries {
 		copy {
 			from configurations.libs
 			into "${buildDir}/autoFVT/lib"
-		}
-		// TODO-6677: Eventually we will not need to copy the jsfContainer integration jar at build-time
-		copy {
-			from rootProject.project('com.ibm.ws.jsfContainer.2.2').buildDir
-			into "${buildDir}/autoFVT/publish/files/mojarra/"
-			include 'com.ibm.ws.jsfContainer.2.2.jar'
 		}
 	}
 }

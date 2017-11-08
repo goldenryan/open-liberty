@@ -10,6 +10,8 @@
  *******************************************************************************/
 package com.ibm.jbatch.container.services;
 
+import java.util.List;
+
 import javax.persistence.TypedQuery;
 
 import com.ibm.jbatch.container.persistence.jpa.JobInstanceEntity;
@@ -33,5 +35,10 @@ public interface IJPAQueryHelper {
      * Set a submitter id to handle authorization
      */
     void setAuthSubmitter(String submitter);
+
+    /**
+     * @param groupsForSubject
+     */
+    void setGroups(List<String> groupsForSubject);
 
 }

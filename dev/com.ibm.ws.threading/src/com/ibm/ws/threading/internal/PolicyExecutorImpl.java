@@ -30,14 +30,15 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.LockSupport;
 
 import com.ibm.websphere.ras.Tr;
 import com.ibm.websphere.ras.TraceComponent;
 import com.ibm.websphere.ras.annotation.Trivial;
 import com.ibm.ws.ffdc.annotation.FFDCIgnore;
 import com.ibm.ws.threading.PolicyExecutor;
-import com.ibm.ws.threading.internal.PolicyTaskFutureImpl.InvokeAnyCompletionTracker;
+import com.ibm.ws.threading.PolicyTaskCallback;
+import com.ibm.ws.threading.PolicyTaskFuture;
+import com.ibm.ws.threading.internal.PolicyTaskFutureImpl.InvokeAnyLatch;
 
 /**
  * Policy executors are backed by the Liberty global thread pool,
@@ -63,6 +64,8 @@ public class PolicyExecutorImpl implements PolicyExecutor {
 
     private int maxConcurrency;
 
+    private volatile boolean maxConcurrencyAppliesToCallerThread;
+
     private final ReduceableSemaphore maxConcurrencyConstraint = new ReduceableSemaphore(0, false);
 
     private int maxQueueSize;
@@ -80,7 +83,7 @@ public class PolicyExecutorImpl implements PolicyExecutor {
 
     final ConcurrentLinkedQueue<PolicyTaskFutureImpl<?>> queue = new ConcurrentLinkedQueue<PolicyTaskFutureImpl<?>>();
 
-    private final AtomicReference<QueueFullAction> queueFullAction = new AtomicReference<QueueFullAction>();
+    private volatile boolean runIfQueueFull;
 
     /**
      * Tasks that are running on policy executor threads.
@@ -106,26 +109,32 @@ public class PolicyExecutorImpl implements PolicyExecutor {
     private final AtomicReference<State> state = new AtomicReference<State>(State.ACTIVE);
 
     /**
-     * Counter of tasks for which we didn't submit a PollingTask in order to honor maxConcurrency.
-     * In deciding whether a PollingTask should be resubmitted, this counter can be decremented (if positive).
+     * Counter of tasks for which we didn't submit a GlobalPoolTask in order to honor maxConcurrency.
+     * In deciding whether a GlobalPoolTask should be resubmitted, this counter can be decremented (if positive).
      */
     private final AtomicInteger withheldConcurrency = new AtomicInteger();
 
     @Trivial
     private static enum State {
-        ACTIVE, // task submit/start/run all possible
-        ENQUEUE_STOPPING, // enqueue is being disabled, submit might be possible, start/run still possible
-        ENQUEUE_STOPPED, // task submit disallowed, start/run still possible
-        TASKS_CANCELING, // task submit disallowed, start/run might be possible, queued and running tasks are being canceled
-        TASKS_CANCELED, // task submit/start disallowed, waiting for all tasks to end
-        TERMINATED // task submit/start/run all disallowed
+        ACTIVE(true), // task submit/start/run all possible
+        ENQUEUE_STOPPING(true), // enqueue is being disabled, submit might be possible, start/run still possible
+        ENQUEUE_STOPPED(true), // task submit disallowed, start/run still possible
+        TASKS_CANCELING(false), // task submit disallowed, start/run might be possible, queued and running tasks are being canceled
+        TASKS_CANCELED(false), // task submit/start disallowed, waiting for all tasks to end
+        TERMINATED(false); // task submit/start/run all disallowed
+
+        boolean canStartTask;
+
+        private State(boolean canStartTask) {
+            this.canStartTask = canStartTask;
+        }
     }
 
     /**
-     * Polling tasks run on the global thread pool.
+     * These tasks run on the global thread pool.
      * Their role is to run tasks that are queued up on the policy executor.
      */
-    private class PollingTask implements QueueItem, Runnable {
+    private class GlobalPoolTask implements QueueItem, Runnable {
         // Indicates whether or not this task should be expedited vs enqueued.
         private boolean expedite;
 
@@ -138,19 +147,18 @@ public class PolicyExecutorImpl implements PolicyExecutor {
         public void run() {
             boolean canRun;
             PolicyTaskFutureImpl<?> next;
-            do {
-                // Check the state to reduce the possibility of removing a queued task that we will not be able to run
-                State currentState = state.get();
-                canRun = currentState == State.ACTIVE || currentState == State.ENQUEUE_STOPPING || currentState == State.ENQUEUE_STOPPED;
-                next = canRun ? queue.poll() : null;
-                if (next == null)
-                    break;
-                else
-                    maxQueueSizeConstraint.release();
-            } while (next.isCancelled());
+            while ((next = (canRun = state.get().canStartTask) ? queue.poll() : null) != null && next.isCancelled()) {
+                next.nsRunEnd = next.nsQueueEnd = System.nanoTime();
+                maxQueueSizeConstraint.release();
+                if (next.callback != null)
+                    next.callback.onEnd(next.task, next, null, true, 0, null); // aborted, queued task will never run
+            }
 
-            if (next != null)
+            if (next != null) {
+                maxQueueSizeConstraint.release();
+                next.nsQueueEnd = System.nanoTime();
                 runTask(next);
+            }
 
             // Release permits against core/maxConcurrency
             if (expedite)
@@ -165,9 +173,9 @@ public class PolicyExecutorImpl implements PolicyExecutor {
             if (canRun && withheldConcurrency.get() > 0 && maxConcurrencyConstraint.tryAcquire()) {
                 decrementWithheldConcurrency();
                 if (acquireCoreConcurrency() > 0)
-                    expediteGlobal(PollingTask.this);
+                    expediteGlobal(GlobalPoolTask.this);
                 else
-                    enqueueGlobal(PollingTask.this);
+                    enqueueGlobal(GlobalPoolTask.this);
             }
         }
     }
@@ -283,7 +291,7 @@ public class PolicyExecutorImpl implements PolicyExecutor {
                 case ENQUEUE_STOPPED:
                 case TASKS_CANCELING:
                 case TASKS_CANCELED:
-                    // Transition to TERMINATED state if no tasks in the queue and no polling tasks on global executor.
+                    // Transition to TERMINATED state if there are no tasks in the queue and we have no tasks on the global executor.
                     if (queue.isEmpty()) {
                         if (remaining > 0 ? maxConcurrencyConstraint.tryAcquire(maxConcurrency, remaining < pollInterval ? remaining : pollInterval, TimeUnit.NANOSECONDS) //
                                         : maxConcurrencyConstraint.tryAcquire(maxConcurrency)) {
@@ -326,14 +334,14 @@ public class PolicyExecutorImpl implements PolicyExecutor {
         }
 
         // Expedite as many of the remaining tasks as the available maxConcurrency permits and increased coreConcurrency
-        // will allow. We are choosing not to revoke PollingTasks that have already been enqueued as non-expedited,
+        // will allow. We are choosing not to revoke GlobalPoolTasks that have already been enqueued as non-expedited,
         // which means we do not guarantee an increased coreConcurrency to fully go into effect immediately.
-        // Any reduction to coreConcurrency is handled gradually, as expedited PollingTasks complete.
+        // Any reduction to coreConcurrency is handled gradually, as expedited GlobalPoolTasks complete.
         if (cca > 0) {
             while (cca-- > 0 && withheldConcurrency.get() > 0 && maxConcurrencyConstraint.tryAcquire())
                 if (acquireCoreConcurrency() > 0) {
                     decrementWithheldConcurrency();
-                    expediteGlobal(new PollingTask());
+                    expediteGlobal(new GlobalPoolTask());
                 } else {
                     maxConcurrencyConstraint.release();
                     break;
@@ -345,7 +353,7 @@ public class PolicyExecutorImpl implements PolicyExecutor {
 
     /**
      * Decrement the counter of withheld concurrency only if positive.
-     * This method should only ever be invoked if the caller is about to enqueue a PollingTask to the global executor.
+     * This method should only ever be invoked if the caller is about to enqueue a task to the global executor.
      * Otherwise there is a risk of a race condition where withheldConcurrency decrements to 0 with a task still on the queue.
      */
     @Trivial
@@ -359,13 +367,14 @@ public class PolicyExecutorImpl implements PolicyExecutor {
     /**
      * Attempt to add a task to the policy executor's queue, following the configured
      * behavior for waiting and rejecting vs running on the current thread if the queue is at capacity.
-     * As needed, ensure that polling tasks are submitted to the global executor to process
+     * As needed, ensure that tasks are submitted to the global executor to process
      * the queued up tasks.
      *
      * @param policyTaskFuture submitted task and its Future.
      * @param wait amount of time to wait for a queue position.
-     * @param callerRunsOverride indicates if a task should always or may never run on the current thread
-     *            if no queue positions are available. A value of null means the queueFullAction will determine.
+     * @param runIfQueueFullOverride indicates if a task should always or may never run on the current thread
+     *            if no queue positions are available. A value of null means the runIfQueueFull configuration will determine.
+     *            A value of true must only be specified if the caller already has a permit or doesn't need one.
      * @return true if the task was enqueued for later execution by the global thread pool.
      *         If the task instead ran on the current thread, then returns false.
      * @throws RejectedExecutionException if the task is rejected rather than being queued.
@@ -373,71 +382,82 @@ public class PolicyExecutorImpl implements PolicyExecutor {
      *             the InterruptedException is chained to the RejectedExecutionException.
      */
     @FFDCIgnore(value = { InterruptedException.class, RejectedExecutionException.class }) // these are raised directly to invoker, who decides how to handle
-    private boolean enqueue(PolicyTaskFutureImpl<?> policyTaskFuture, long wait, Boolean callerRunsOverride) {
+    private boolean enqueue(PolicyTaskFutureImpl<?> policyTaskFuture, long wait, Boolean runIfQueueFullOverride) {
         boolean enqueued;
         try {
             if (wait <= 0 ? maxQueueSizeConstraint.tryAcquire() : maxQueueSizeConstraint.tryAcquire(wait, TimeUnit.NANOSECONDS)) {
                 enqueued = queue.offer(policyTaskFuture);
+                policyTaskFuture.accept(false);
+
                 int w = withheldConcurrency.incrementAndGet();
                 if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
                     Tr.debug(this, tc, "withheld concurrency --> " + w);
                 if (maxConcurrencyConstraint.tryAcquire()) {
                     decrementWithheldConcurrency();
                     if (acquireCoreConcurrency() > 0)
-                        expediteGlobal(new PollingTask());
+                        expediteGlobal(new GlobalPoolTask());
                     else
-                        enqueueGlobal(new PollingTask());
+                        enqueueGlobal(new GlobalPoolTask());
                 }
 
                 // Check if shutdown occurred since acquiring the permit to enqueue, and if so, try to remove the queued task
                 if (state.get() != State.ACTIVE && queue.remove(policyTaskFuture)) {
+                    policyTaskFuture.nsRunEnd = policyTaskFuture.nsQueueEnd = System.nanoTime();
                     throw new RejectedExecutionException(Tr.formatMessage(tc, "CWWKE1202.submit.after.shutdown", identifier));
                 }
             } else if (state.get() == State.ACTIVE) {
-                QueueFullAction action = Boolean.TRUE.equals(callerRunsOverride) ? QueueFullAction.CallerRuns : queueFullAction.get();
-                if (Boolean.FALSE.equals(callerRunsOverride) && (action == QueueFullAction.CallerRuns || action == QueueFullAction.CallerRunsIfSameExecutor))
-                    action = QueueFullAction.Abort;
-                if (action == QueueFullAction.Abort)
+                boolean havePermit = false;
+                if (Boolean.TRUE.equals(runIfQueueFullOverride) ||
+                    !Boolean.FALSE.equals(runIfQueueFullOverride) && runIfQueueFull
+                                                                   && (!maxConcurrencyAppliesToCallerThread || (havePermit = maxConcurrencyConstraint.tryAcquire())))
+                    try {
+                        policyTaskFuture.accept(true);
+                        runTask(policyTaskFuture);
+                        enqueued = false;
+                    } finally {
+                        if (havePermit)
+                            transferOrReleasePermit();
+                    }
+                else
                     throw new RejectedExecutionException(Tr.formatMessage(tc, "CWWKE1201.queue.full.abort", identifier, maxQueueSize, wait));
-                else if (action == QueueFullAction.CallerRuns) {
-                    runTask(policyTaskFuture);
-                    enqueued = false;
-                } else
-                    throw new UnsupportedOperationException("queueFullAction=" + action); // TODO DiscardOldest, CallerRunsIfSameExecutor, and null (which defaults based on maxConcurrency)
             } else
                 throw new RejectedExecutionException(Tr.formatMessage(tc, "CWWKE1202.submit.after.shutdown", identifier));
         } catch (InterruptedException x) {
             if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
                 Tr.debug(this, tc, "enqueue", x);
+            policyTaskFuture.abort(x);
             throw new RejectedExecutionException(x);
         } catch (RejectedExecutionException x) { // redundant with RuntimeException code path, but added to allow FFDCIgnore
             if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
                 Tr.debug(this, tc, "enqueue", x);
+            policyTaskFuture.abort(x);
             throw x;
         } catch (RuntimeException x) {
             if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
                 Tr.debug(this, tc, "enqueue", x);
+            policyTaskFuture.abort(x);
             throw x;
         } catch (Error x) {
             if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
                 Tr.debug(this, tc, "enqueue", x);
+            policyTaskFuture.abort(x);
             throw x;
         }
         return enqueued;
     }
 
     /**
-     * Queue a polling task to the global executor.
+     * Queue a task to the global executor.
      * Prereq: maxConcurrencyConstraint permit must already be acquired to reflect the task being queued to global.
      * If unsuccessful in queuing to global, this method releases the maxConcurrencyConstraint permit.
      *
-     * @param pollingTask task that can execute tasks that are queued to the policy executor.
+     * @param globalTask task that can execute tasks that are queued to the policy executor.
      */
-    void enqueueGlobal(PollingTask pollingTask) {
-        pollingTask.expedite = false;
+    private void enqueueGlobal(GlobalPoolTask globalTask) {
+        globalTask.expedite = false;
         boolean submitted = false;
         try {
-            globalExecutor.executeWithoutInterceptors(pollingTask);
+            globalExecutor.executeWithoutInterceptors(globalTask);
             submitted = true;
         } finally {
             if (!submitted) {
@@ -451,23 +471,23 @@ public class PolicyExecutorImpl implements PolicyExecutor {
 
     @Override
     public void execute(Runnable command) {
-        enqueue(new PolicyTaskFutureImpl<Void>(this, command, null), maxWaitForEnqueueNS.get(), null);
+        enqueue(new PolicyTaskFutureImpl<Void>(this, command, null, null), maxWaitForEnqueueNS.get(), null);
     }
 
     /**
-     * Expedite a polling task to the global executor.
+     * Expedite a task to the global executor.
      * Prereq: maxConcurrencyConstraint permit must already be acquired and
      * coreConcurrencyAvailable must already be decremented to reflect the task being expedited to global.
      * If unsuccessful in expediting to global, this method releases the maxConcurrencyConstraint permit
      * and increments coreConcurrencyAvailable.
      *
-     * @param pollingTask task that can execute tasks that are queued to the policy executor.
+     * @param globalTask task that can execute tasks that are queued to the policy executor.
      */
-    void expediteGlobal(PollingTask pollingTask) {
-        pollingTask.expedite = true;
+    private void expediteGlobal(GlobalPoolTask globalTask) {
+        globalTask.expedite = true;
         boolean submitted = false;
         try {
-            globalExecutor.executeWithoutInterceptors(pollingTask);
+            globalExecutor.executeWithoutInterceptors(globalTask);
             submitted = true;
         } finally {
             if (!submitted) {
@@ -480,29 +500,43 @@ public class PolicyExecutorImpl implements PolicyExecutor {
         }
     }
 
-    // Submit and run tasks and return list of completed (possibly canceled) tasks.
-    // Because this method is not timed, tasks can run on the current thread if queueFullAction is CallerRuns or a permit is available.
     @Override
-    @FFDCIgnore(value = { RejectedExecutionException.class })
-    public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks) throws InterruptedException {
-        final boolean trace = TraceComponent.isAnyTracingEnabled();
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+    @Trivial
+    public final <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks) throws InterruptedException {
+        return (List) invokeAll(tasks, null);
+    }
 
-        // Satisfy requirement of JavaDoc:
-        for (Callable<T> task : tasks)
-            if (task == null)
-                throw new NullPointerException();
+    @Override
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+    @Trivial
+    public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit) throws InterruptedException {
+        return (List) invokeAll(tasks, null, timeout, unit);
+    }
+
+    // Submit and run tasks and return list of completed (possibly canceled) tasks.
+    // Because this method is not timed, tasks can run on the current thread if maxConcurrencyAppliesToCallerThread is false or a permit is available.
+    @FFDCIgnore(value = { RejectedExecutionException.class })
+    @Override
+    public <T> List<PolicyTaskFuture<T>> invokeAll(Collection<? extends Callable<T>> tasks, PolicyTaskCallback[] callbacks) throws InterruptedException {
+        final boolean trace = TraceComponent.isAnyTracingEnabled();
 
         // Determine if we need a permit to run one or more of the tasks on the current thread, and if so, acquire it,
         int taskCount = tasks.size();
-        boolean useCurrentThread = queueFullAction.get() == QueueFullAction.CallerRuns;
-        boolean havePermit = !useCurrentThread && (useCurrentThread = taskCount > 0 && maxConcurrencyConstraint.tryAcquire());
+        boolean havePermit = false;
+        boolean useCurrentThread = !maxConcurrencyAppliesToCallerThread || (havePermit = taskCount > 0 && maxConcurrencyConstraint.tryAcquire());
 
-        ArrayList<Future<T>> futures = new ArrayList<Future<T>>(taskCount);
+        List<PolicyTaskFutureImpl<T>> futures = new ArrayList<PolicyTaskFutureImpl<T>>(taskCount);
         try {
-            // submit tasks (except the last if we are able to run tasks on the current thread)
-            int t = 0, numToSubmitAsync = useCurrentThread ? taskCount - 1 : taskCount;
-            for (Callable<T> task : tasks) {
-                PolicyTaskFutureImpl<T> taskFuture = new PolicyTaskFutureImpl<T>(this, task);
+            // create futures in advance, which gives the callback an opportunity to reject
+            int t = 0;
+            for (Callable<T> task : tasks)
+                futures.add(new PolicyTaskFutureImpl<T>(this, task, callbacks == null ? null : callbacks[t++]));
+
+            // enqueue tasks (except the last if we are able to run tasks on the current thread)
+            int numToSubmitAsync = useCurrentThread ? taskCount - 1 : taskCount;
+            t = 0;
+            for (PolicyTaskFutureImpl<T> taskFuture : futures)
                 if (t++ < numToSubmitAsync) {
                     boolean enqueued;
                     if (useCurrentThread)
@@ -512,22 +546,21 @@ public class PolicyExecutorImpl implements PolicyExecutor {
 
                     if (!enqueued) // must immediately return if ran on current thread and was interrupted
                         taskFuture.throwIfInterrupted();
+                } else {
+                    taskFuture.accept(true);
                 }
-                futures.add(taskFuture);
-            }
 
             // run on current thread if possible
             if (useCurrentThread)
                 for (t = numToSubmitAsync; t >= 0; t--) {
-                    PolicyTaskFutureImpl<T> taskFuture = (PolicyTaskFutureImpl<T>) futures.get(t);
+                    PolicyTaskFutureImpl<T> taskFuture = futures.get(t);
                     State currentState = state.get();
                     if (t == numToSubmitAsync) { // we intentionally avoided submitting the last task
                         if (currentState != State.ACTIVE)
                             throw new RejectedExecutionException(Tr.formatMessage(tc, "CWWKE1202.submit.after.shutdown", identifier));
-                    } else if (!taskFuture.isDone()
-                               && (currentState == State.ACTIVE || currentState == State.ENQUEUE_STOPPING || currentState == State.ENQUEUE_STOPPED)
-                               && queue.remove(taskFuture)) {
+                    } else if (!taskFuture.isDone() && currentState.canStartTask && queue.remove(taskFuture)) {
                         maxQueueSizeConstraint.release();
+                        taskFuture.nsQueueEnd = System.nanoTime();
                     } else {
                         if (trace && tc.isDebugEnabled())
                             Tr.debug(this, tc, "no longer in queue", taskFuture);
@@ -541,8 +574,8 @@ public class PolicyExecutorImpl implements PolicyExecutor {
                 }
 
             // wait for completion
-            for (Future<T> future : futures) {
-                ((PolicyTaskFutureImpl<T>) future).await();
+            for (PolicyTaskFutureImpl<T> future : futures) {
+                future.await();
                 taskCount--;
             }
         } catch (RejectedExecutionException x) {
@@ -553,66 +586,53 @@ public class PolicyExecutorImpl implements PolicyExecutor {
             else
                 throw x;
         } finally {
-            // Release the permit that we acquired in order to run tasks on this thread,
-            if (havePermit) {
-                maxConcurrencyConstraint.release();
-
-                if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
-                    Tr.debug(PolicyExecutorImpl.this, tc, "core/maxConcurrency available",
-                             coreConcurrencyAvailable, maxConcurrencyConstraint.availablePermits());
-
-                // The permit might be needed to run tasks on the global executor,
-                if (!queue.isEmpty() && withheldConcurrency.get() > 0 && maxConcurrencyConstraint.tryAcquire()) {
-                    decrementWithheldConcurrency();
-                    if (acquireCoreConcurrency() > 0)
-                        expediteGlobal(new PollingTask());
-                    else
-                        enqueueGlobal(new PollingTask());
-                }
-            }
+            if (havePermit)
+                transferOrReleasePermit();
 
             if (taskCount != 0)
                 for (Future<T> f : futures)
                     f.cancel(true);
         }
 
-        return futures;
+        @SuppressWarnings({ "rawtypes", "unchecked" })
+        List<PolicyTaskFuture<T>> list = (List) futures;
+        return list;
     }
 
     // Submit and run tasks within allotted interval and return list of completed (possibly canceled) tasks.
     // Because this method is timed, tasks will never run on the invoker's current thread.
-    @Override
     @FFDCIgnore(value = { RejectedExecutionException.class })
-    public <T> List<Future<T>> invokeAll(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit) throws InterruptedException {
+    @Override
+    public <T> List<PolicyTaskFuture<T>> invokeAll(Collection<? extends Callable<T>> tasks, PolicyTaskCallback[] callbacks, long timeout,
+                                                   TimeUnit unit) throws InterruptedException {
         final boolean trace = TraceComponent.isAnyTracingEnabled();
 
         int taskCount = tasks.size();
         long stop = System.nanoTime() + unit.toNanos(timeout);
         long qWait, remaining;
 
-        // Satisfy requirement of JavaDoc:
-        for (Callable<T> task : tasks)
-            if (task == null)
-                throw new NullPointerException();
-
-        ArrayList<Future<T>> futures = new ArrayList<Future<T>>(taskCount);
+        List<PolicyTaskFutureImpl<T>> futures = new ArrayList<PolicyTaskFutureImpl<T>>(taskCount);
         try {
-            // submit all tasks
-            for (Callable<T> task : tasks) {
-                PolicyTaskFutureImpl<T> taskFuture = new PolicyTaskFutureImpl<T>(this, task);
+            // create futures in advance, which gives the callback an opportunity to reject
+            int t = 0;
+            for (Callable<T> task : tasks)
+                futures.add(new PolicyTaskFutureImpl<T>(this, task, callbacks == null ? null : callbacks[t++]));
+
+            // enqueue all tasks
+            for (PolicyTaskFutureImpl<T> taskFuture : futures) {
                 remaining = stop - System.nanoTime();
                 if (remaining <= 0)
-                    throw new RejectedExecutionException(Tr.formatMessage(tc, "CWWKE1204.unable.to.invoke", identifier, taskCount - futures.size(), taskCount, timeout, unit));
+                    throw new RejectedExecutionException(Tr.formatMessage(tc, "CWWKE1204.unable.to.invoke", identifier, taskCount - futures.indexOf(taskFuture) + 1, taskCount,
+                                                                          timeout, unit));
                 qWait = maxWaitForEnqueueNS.get();
                 enqueue(taskFuture,
                         qWait < remaining ? qWait : remaining, // limit waiting to lesser of maxWaitForEnqueue and remaining time
                         false); // never run on the current thread because it would prevent timeout
-                futures.add(taskFuture);
             }
 
             // wait for completion
-            for (Future<T> future : futures)
-                if (((PolicyTaskFutureImpl<T>) future).await(stop - System.nanoTime(), TimeUnit.NANOSECONDS))
+            for (PolicyTaskFutureImpl<T> future : futures)
+                if (future.await(stop - System.nanoTime(), TimeUnit.NANOSECONDS))
                     taskCount--;
                 else
                     break;
@@ -629,25 +649,40 @@ public class PolicyExecutorImpl implements PolicyExecutor {
                     f.cancel(true);
         }
 
-        return futures;
+        @SuppressWarnings({ "rawtypes", "unchecked" })
+        List<PolicyTaskFuture<T>> list = (List) futures;
+        return list;
     }
 
     @Override
-    @FFDCIgnore(value = { RejectedExecutionException.class })
+    @Trivial
     public <T> T invokeAny(Collection<? extends Callable<T>> tasks) throws InterruptedException, ExecutionException {
+        return invokeAny(tasks, null);
+    }
+
+    @Override
+    @Trivial
+    public <T> T invokeAny(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+        return invokeAny(tasks, null, timeout, unit);
+    }
+
+    // Submit a group of tasks, waiting for one to complete successfully or for all to have failed or been canceled.
+    // Because this method is not timed, we allow an optimization where if only a single task is submitted it can run on the current thread.
+    @Override
+    @FFDCIgnore(value = { RejectedExecutionException.class })
+    public <T> T invokeAny(Collection<? extends Callable<T>> tasks, PolicyTaskCallback[] callbacks) throws InterruptedException, ExecutionException {
         int taskCount = tasks.size();
 
         // Special case to run a single task on the current thread if we can acquire a permit, if a permit is required
         if (taskCount == 1) {
-            boolean useCurrentThread = queueFullAction.get() == QueueFullAction.CallerRuns;
-            boolean havePermit = !useCurrentThread && (useCurrentThread = taskCount > 0 && maxConcurrencyConstraint.tryAcquire());
-            if (useCurrentThread)
+            boolean havePermit = false;
+            if (!maxConcurrencyAppliesToCallerThread || (havePermit = maxConcurrencyConstraint.tryAcquire())) // use current thread
                 try {
                     if (state.get() != State.ACTIVE)
                         throw new RejectedExecutionException(Tr.formatMessage(tc, "CWWKE1202.submit.after.shutdown", identifier));
 
-                    PolicyTaskFutureImpl<T> taskFuture = new PolicyTaskFutureImpl<T>(this, tasks.iterator().next());
-
+                    PolicyTaskFutureImpl<T> taskFuture = new PolicyTaskFutureImpl<T>(this, tasks.iterator().next(), callbacks == null ? null : callbacks[0]);
+                    taskFuture.accept(true);
                     runTask(taskFuture);
 
                     // raise InterruptedException if current thread is interrupted
@@ -655,90 +690,75 @@ public class PolicyExecutorImpl implements PolicyExecutor {
 
                     return taskFuture.get();
                 } finally {
-                    // Release the permit that we acquired in order to run tasks on this thread,
-                    if (havePermit) {
-                        maxConcurrencyConstraint.release();
-
-                        if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
-                            Tr.debug(PolicyExecutorImpl.this, tc, "core/maxConcurrency available",
-                                     coreConcurrencyAvailable, maxConcurrencyConstraint.availablePermits());
-
-                        // The permit might be needed to run tasks on the global executor,
-                        if (!queue.isEmpty() && withheldConcurrency.get() > 0 && maxConcurrencyConstraint.tryAcquire()) {
-                            decrementWithheldConcurrency();
-                            if (acquireCoreConcurrency() > 0)
-                                expediteGlobal(new PollingTask());
-                            else
-                                enqueueGlobal(new PollingTask());
-                        }
-                    }
+                    if (havePermit)
+                        transferOrReleasePermit();
                 }
-        } else if (taskCount == 0) // JavaDoc doesn't specify what to do in this case. Match observed behavior of ThreadPoolExecutor for now.
+        } else if (taskCount == 0)
             throw new IllegalArgumentException();
 
-        // Satisfy requirement of JavaDoc:
-        for (Callable<T> task : tasks)
-            if (task == null)
-                throw new NullPointerException();
-
-        InvokeAnyCompletionTracker tracker = new InvokeAnyCompletionTracker(taskCount);
+        InvokeAnyLatch latch = new InvokeAnyLatch(taskCount);
         ArrayList<PolicyTaskFutureImpl<T>> futures = new ArrayList<PolicyTaskFutureImpl<T>>(taskCount);
         try {
-            // submit all tasks
-            for (Callable<T> task : tasks) {
-                PolicyTaskFutureImpl<T> taskFuture = new PolicyTaskFutureImpl<T>(this, task, tracker);
+            // create futures in advance, which gives the callback an opportunity to reject
+            int t = 0;
+            for (Callable<T> task : tasks)
+                futures.add(new PolicyTaskFutureImpl<T>(this, task, callbacks == null ? null : callbacks[t++], latch));
 
+            // enqueue all tasks
+            for (PolicyTaskFutureImpl<T> taskFuture : futures) {
                 // check if done before enqueuing more tasks
-                if (tracker.hasSuccessfulResult())
+                if (latch.getCount() == 0)
                     break;
 
                 enqueue(taskFuture, maxWaitForEnqueueNS.get(), false); // never run on the current thread because it would prevent timeout
-
-                futures.add(taskFuture);
             }
 
-            while (!Thread.interrupted())
-                LockSupport.park(tracker);
+            // wait for completion
+            return latch.await(-1, futures);
         } catch (RejectedExecutionException x) {
             if (x.getCause() instanceof InterruptedException) {
                 throw (InterruptedException) x.getCause();
             } else
                 throw x;
+        } catch (TimeoutException x) {
+            throw new RuntimeException(x); // should be unreachable with infinite timeout
         } finally {
-            T result = tracker.completeInvokeAny(futures);
-            if (result != null || tracker.hasSuccessfulResult())
-                return result;
+            for (Future<?> f : futures)
+                f.cancel(true);
         }
-
-        // Only reachable if invokeAny was interrupted.
-        throw new InterruptedException();
     }
 
+    // Submit a group of tasks, waiting until the timeout is reached for one to complete successfully or for all to have failed or been canceled.
+    // Because this method is timed, tasks will never run on the invoker's current thread.
     @Override
     @FFDCIgnore(value = { RejectedExecutionException.class })
-    public <T> T invokeAny(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
+    public <T> T invokeAny(Collection<? extends Callable<T>> tasks, PolicyTaskCallback[] callbacks, long timeout,
+                           TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
         int taskCount = tasks.size();
         long stop = System.nanoTime() + unit.toNanos(timeout);
         long qWait, remaining;
 
-        if (taskCount == 0) // JavaDoc doesn't specify what to do in this case. Match observed behavior of ThreadPoolExecutor for now.
+        if (taskCount == 0) // JavaDoc doesn't specify what to do in this case. Match behavior of untimed invokeAny.
             throw new IllegalArgumentException();
 
-        // Satisfy requirement of JavaDoc:
-        for (Callable<T> task : tasks)
-            if (task == null)
-                throw new NullPointerException();
-
-        InvokeAnyCompletionTracker tracker = new InvokeAnyCompletionTracker(taskCount);
+        InvokeAnyLatch latch = new InvokeAnyLatch(taskCount);
         ArrayList<PolicyTaskFutureImpl<T>> futures = new ArrayList<PolicyTaskFutureImpl<T>>(taskCount);
         try {
-            // submit all tasks
+            // create futures in advance, which gives the callback an opportunity to reject
+            int t = 0;
             for (Callable<T> task : tasks) {
-                PolicyTaskFutureImpl<T> taskFuture = new PolicyTaskFutureImpl<T>(this, task, tracker);
+                remaining = stop - System.nanoTime();
+                futures.add(new PolicyTaskFutureImpl<T>(this, task, callbacks == null ? null : callbacks[t++], latch));
+                if (remaining <= 0)
+                    throw new RejectedExecutionException(Tr.formatMessage(tc, "CWWKE1204.unable.to.invoke", identifier, taskCount - futures.size(), taskCount, timeout, unit));
+            }
+
+            // enqueue all tasks
+            for (PolicyTaskFutureImpl<T> taskFuture : futures) {
                 remaining = stop - System.nanoTime();
 
                 // check if done before enqueuing more tasks
-                if (tracker.hasSuccessfulResult())
+                if (latch.getCount() == 0)
                     break;
 
                 if (remaining <= 0)
@@ -747,22 +767,19 @@ public class PolicyExecutorImpl implements PolicyExecutor {
                 enqueue(taskFuture,
                         qWait < remaining ? qWait : remaining, // limit waiting to lesser of maxWaitForEnqueue and remaining time
                         false); // never run on the current thread because it would prevent timeout
-                futures.add(taskFuture);
             }
 
             // wait for completion
-            TimeUnit.NANOSECONDS.sleep(stop - System.nanoTime());
-
-            throw new TimeoutException();
+            remaining = stop - System.nanoTime();
+            return latch.await(remaining < 0 ? 0 : remaining, futures);
         } catch (RejectedExecutionException x) {
-            if (x.getCause() instanceof InterruptedException) {
+            if (x.getCause() instanceof InterruptedException)
                 throw (InterruptedException) x.getCause();
-            } else
+            else
                 throw x;
         } finally {
-            T result = tracker.completeInvokeAny(futures);
-            if (result != null || tracker.hasSuccessfulResult())
-                return result;
+            for (Future<?> f : futures)
+                f.cancel(true);
         }
     }
 
@@ -786,7 +803,7 @@ public class PolicyExecutorImpl implements PolicyExecutor {
             case ENQUEUE_STOPPED:
             case TASKS_CANCELING:
             case TASKS_CANCELED:
-                // Transition to TERMINATED state if no tasks in the queue and no polling tasks on global executor
+                // Transition to TERMINATED state if there are no tasks in the queue and we have no tasks on the global executor
                 if (queue.isEmpty() && maxConcurrencyConstraint.tryAcquire(maxConcurrency)) {
                     State previous = state.getAndSet(State.TERMINATED);
                     if (TraceComponent.isAnyTracingEnabled() && tc.isEventEnabled())
@@ -826,8 +843,21 @@ public class PolicyExecutorImpl implements PolicyExecutor {
 
         while (withheldConcurrency.get() > 0 && maxConcurrencyConstraint.tryAcquire()) {
             decrementWithheldConcurrency();
-            enqueueGlobal(new PollingTask());
+            enqueueGlobal(new GlobalPoolTask());
         }
+
+        return this;
+    }
+
+    @Override
+    public PolicyExecutor maxConcurrencyAppliesToCallerThread(boolean applyToCallerThread) {
+        if (providerCreated == null)
+            throw new UnsupportedOperationException();
+
+        if (state.get() != State.ACTIVE)
+            throw new IllegalStateException(Tr.formatMessage(tc, "CWWKE1203.config.update.after.shutdown", "maxConcurrencyAppliesToCallerThread", identifier));
+
+        maxConcurrencyAppliesToCallerThread = applyToCallerThread;
 
         return this;
     }
@@ -873,14 +903,14 @@ public class PolicyExecutorImpl implements PolicyExecutor {
     }
 
     @Override
-    public PolicyExecutor queueFullAction(QueueFullAction action) {
+    public PolicyExecutor runIfQueueFull(boolean runIfFull) {
         if (providerCreated == null)
             throw new UnsupportedOperationException();
 
         if (state.get() != State.ACTIVE)
-            throw new IllegalStateException(Tr.formatMessage(tc, "CWWKE1203.config.update.after.shutdown", "queueFullAction", identifier));
+            throw new IllegalStateException(Tr.formatMessage(tc, "CWWKE1203.config.update.after.shutdown", "runIfQueueFull", identifier));
 
-        queueFullAction.set(action);
+        runIfQueueFull = runIfFull;
 
         return this;
     }
@@ -896,13 +926,15 @@ public class PolicyExecutorImpl implements PolicyExecutor {
             if (providerCreated != null) // the following code only matters when life cycle operations are permitted
                 running.add(future); // intentionally done before checking state to avoid missing cancels on shutdownNow
 
-            State currentState = state.get();
-            if (currentState == State.ACTIVE || currentState == State.ENQUEUE_STOPPING || currentState == State.ENQUEUE_STOPPED) {
+            if (state.get().canStartTask) {
                 future.run();
             } else {
                 if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
-                    Tr.debug(this, tc, "Cancel task due to policy executor state " + currentState);
+                    Tr.debug(this, tc, "Cancel task due to policy executor state " + state);
+                future.nsRunEnd = System.nanoTime();
                 future.cancel(false);
+                if (future.callback != null)
+                    future.callback.onEnd(future.task, future, null, true, 0, null); // aborted, queued task will never run
             }
         } catch (Error x) {
             // auto FFDC
@@ -994,23 +1026,58 @@ public class PolicyExecutorImpl implements PolicyExecutor {
 
     @Override
     public <T> Future<T> submit(Callable<T> task) {
-        PolicyTaskFutureImpl<T> policyTaskFuture = new PolicyTaskFutureImpl<T>(this, task);
+        PolicyTaskFutureImpl<T> policyTaskFuture = new PolicyTaskFutureImpl<T>(this, task, null);
         enqueue(policyTaskFuture, maxWaitForEnqueueNS.get(), null);
         return policyTaskFuture;
     }
 
     @Override
-    public <T> Future<T> submit(Runnable task, T result) {
-        PolicyTaskFutureImpl<T> policyTaskFuture = new PolicyTaskFutureImpl<T>(this, task, result);
+    public <T> PolicyTaskFuture<T> submit(Callable<T> task, PolicyTaskCallback callback) {
+        PolicyTaskFutureImpl<T> policyTaskFuture = new PolicyTaskFutureImpl<T>(this, task, callback);
         enqueue(policyTaskFuture, maxWaitForEnqueueNS.get(), null);
         return policyTaskFuture;
     }
 
     @Override
     public Future<?> submit(Runnable task) {
-        PolicyTaskFutureImpl<?> policyTaskFuture = new PolicyTaskFutureImpl<Void>(this, task, null);
+        PolicyTaskFutureImpl<?> policyTaskFuture = new PolicyTaskFutureImpl<Void>(this, task, null, null);
         enqueue(policyTaskFuture, maxWaitForEnqueueNS.get(), null);
         return policyTaskFuture;
+    }
+
+    @Override
+    public <T> Future<T> submit(Runnable task, T result) {
+        PolicyTaskFutureImpl<T> policyTaskFuture = new PolicyTaskFutureImpl<T>(this, task, result, null);
+        enqueue(policyTaskFuture, maxWaitForEnqueueNS.get(), null);
+        return policyTaskFuture;
+    }
+
+    @Override
+    public <T> PolicyTaskFuture<T> submit(Runnable task, T result, PolicyTaskCallback callback) {
+        PolicyTaskFutureImpl<T> policyTaskFuture = new PolicyTaskFutureImpl<T>(this, task, result, callback);
+        enqueue(policyTaskFuture, maxWaitForEnqueueNS.get(), null);
+        return policyTaskFuture;
+    }
+
+    /**
+     * Releases a permit against maxConcurrency or transfers it to a worker task that runs on the global thread pool.
+     */
+    @Trivial
+    private void transferOrReleasePermit() {
+        maxConcurrencyConstraint.release();
+
+        if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
+            Tr.debug(this, tc, "core/maxConcurrency available",
+                     coreConcurrencyAvailable, maxConcurrencyConstraint.availablePermits());
+
+        // The permit might be needed to run tasks on the global executor,
+        if (!queue.isEmpty() && withheldConcurrency.get() > 0 && maxConcurrencyConstraint.tryAcquire()) {
+            decrementWithheldConcurrency();
+            if (acquireCoreConcurrency() > 0)
+                expediteGlobal(new GlobalPoolTask());
+            else
+                enqueueGlobal(new GlobalPoolTask());
+        }
     }
 
     public void introspect(PrintWriter out) {
@@ -1018,10 +1085,10 @@ public class PolicyExecutorImpl implements PolicyExecutor {
         final String DOUBLEINDENT = INDENT + INDENT;
         out.println(identifier);
         out.println(INDENT + "coreConcurrency = " + coreConcurrency);
-        out.println(INDENT + "maxConcurrency = " + maxConcurrency);
+        out.println(INDENT + "maxConcurrency = " + maxConcurrency + (maxConcurrencyAppliesToCallerThread ? " + caller threads" : ""));
         out.println(INDENT + "maxQueueSize = " + maxQueueSize);
         out.println(INDENT + "maxWaitForEnqueue = " + TimeUnit.NANOSECONDS.toMillis(maxWaitForEnqueueNS.get()) + " ms");
-        out.println(INDENT + "queueFullAction = " + queueFullAction.toString());
+        out.println(INDENT + "runIfQueueFull = " + runIfQueueFull);
         int numRunningThreads, numRunningPrioritizedThreads;
         synchronized (configLock) {
             numRunningThreads = maxConcurrency - maxConcurrencyConstraint.availablePermits();

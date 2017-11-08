@@ -176,4 +176,9 @@ public interface WSBatchAuthService {
      * @return
      */
     public List<WSJobInstance> filterFoundJobInstancesBasedOnGroupSecurity();
+
+    /**
+     * @return
+     */
+    List<String> getGroupsForSubject();
 }

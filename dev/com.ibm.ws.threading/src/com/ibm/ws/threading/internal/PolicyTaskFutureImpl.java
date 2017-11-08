@@ -12,14 +12,13 @@ package com.ibm.ws.threading.internal;
 
 import java.security.AccessController;
 import java.security.PrivilegedAction;
-import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.AbstractQueuedSynchronizer;
 
@@ -27,6 +26,8 @@ import com.ibm.websphere.ras.Tr;
 import com.ibm.websphere.ras.TraceComponent;
 import com.ibm.websphere.ras.annotation.Trivial;
 import com.ibm.ws.ffdc.annotation.FFDCIgnore;
+import com.ibm.ws.threading.PolicyTaskCallback;
+import com.ibm.ws.threading.PolicyTaskFuture;
 
 /**
  * Allows the policy executor to tie into internal state and other details of a Future implementation.
@@ -34,11 +35,11 @@ import com.ibm.ws.ffdc.annotation.FFDCIgnore;
  *
  * @param <T> type of the result.
  */
-public class PolicyTaskFutureImpl<T> implements Future<T> {
+public class PolicyTaskFutureImpl<T> implements PolicyTaskFuture<T> {
     private static final TraceComponent tc = Tr.register(PolicyTaskFutureImpl.class);
 
     // state constants
-    private static final int SUBMITTED = 0, RUNNING = 1, SUCCESSFUL = 2, FAILED = 3, CANCELING = 4, CANCELED = 5;
+    private static final int PRESUBMIT = 0, SUBMITTED = 1, RUNNING = 2, ABORTED = 3, CANCELING = 4, CANCELED = 5, FAILED = 6, SUCCESSFUL = 7;
 
     /**
      * The task, if a Callable. It is wrapped with interceptors, if any.
@@ -46,9 +47,29 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
     private final Callable<T> callable;
 
     /**
+     * Optional callback for life cycle events.
+     */
+    final PolicyTaskCallback callback;
+
+    /**
      * The policy executor instance.
      */
     private final PolicyExecutorImpl executor;
+
+    /**
+     * Latch for invokeAny futures. Otherwise null.
+     */
+    private final InvokeAnyLatch latch;
+
+    /**
+     * Nanosecond timestamp when this Future was created.
+     */
+    private final long nsAcceptBegin = System.nanoTime();
+
+    /**
+     * Nanosecond timestamps for various points in the task life cycle, initialized to unset (1 less than previous timestamp).
+     */
+    volatile long nsAcceptEnd = nsAcceptBegin - 1, nsQueueEnd = nsAcceptBegin - 2, nsRunEnd = nsAcceptBegin - 3;
 
     /**
      * Predefined result, if any, for Runnable tasks.
@@ -61,12 +82,15 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
     private final Runnable runnable;
 
     /**
-     * Represents the state of the future, and allows for waiters. Initial state is SUBMITTED.
+     * Represents the state of the future, and allows for waiters. Initial state is PRESUBMIT.
      * State transitions in one direction only:
-     * SUBMITTED --> CANCELED,
-     * SUBMITTED --> RUNNING --> SUCCESSFUL,
-     * SUBMITTED --> RUNNING --> CANCELING --> CANCELED,
-     * SUBMITTED --> RUNNING --> FAILED.
+     * PRESUBMIT --> ABORTED
+     * PRESUBMIT --> CANCELED
+     * PRESUBMIT --> SUBMITTED --> ABORTED,
+     * PRESUBMIT --> SUBMITTED --> CANCELED,
+     * PRESUBMIT --> SUBMITTED --> RUNNING --> CANCELING --> CANCELED,
+     * PRESUBMIT --> SUBMITTED --> RUNNING --> FAILED,
+     * PRESUBMIT --> SUBMITTED --> RUNNING --> SUCCESSFUL.
      * Always set the result before updating the state, so that get() operations that await state can rely on the result being available.
      */
     private final State state = new State();
@@ -82,13 +106,8 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
     private volatile Thread thread;
 
     /**
-     * Tracker for invokeAny futures. Otherwise null.
-     */
-    private final InvokeAnyCompletionTracker tracker;
-
-    /**
      * Result of the task. Can be a value, an exception, or other indicator (the state distinguishes).
-     * Initialized to the state field as a way of indicating a result is not set. This allows the possibility of null results.
+     * PRESUBMITized to the state field as a way of indicating a result is not set. This allows the possibility of null results.
      */
     private final AtomicReference<Object> result = new AtomicReference<Object>(state);
 
@@ -111,93 +130,125 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
     }
 
     /**
-     * Tracks completion of an invokeAny operation. The invokeAny method follows a pattern of constructing an instance
-     * of this tracker class from its thread of execution and later invoking completeInvokeAny at the end of the operation.
+     * Latch for invokeAny that supports multiple countdown. When a task fails, we count down the latch by 1.
+     * When a task completes successfully, we immediately count down the latch to 0.
      */
-    static class InvokeAnyCompletionTracker {
-        /**
-         * Count of pending tasks that have not completed or been canceled.
-         */
-        private final AtomicInteger pending;
+    static class InvokeAnyLatch extends AbstractQueuedSynchronizer {
+        private static final long serialVersionUID = 1L;
 
         /**
-         * Populated with first successful result. When set to the tracker instance, it means no successful result has been obtained yet.
+         * Populated with first successful result. When set to the latch instance, it means no successful result has been obtained yet.
+         * Set the result prior to counting down to ensure the result is always present to any thread that awaits the countdown to 0.
          */
         private final AtomicReference<Object> result;
 
         /**
-         * Thread of execution for the invokeAny operation.
+         * @param count count of pending tasks that have not completed or been canceled.
          */
-        private Thread thread;
-
-        InvokeAnyCompletionTracker(int numTasks) {
-            pending = new AtomicInteger(numTasks);
+        @Trivial
+        InvokeAnyLatch(int count) {
+            setState(count);
             result = new AtomicReference<Object>(this);
-            thread = Thread.currentThread();
         }
 
         /**
-         * Completes the processing for the invokeAny method for which this tracker was created.
+         * Await completion of the latch and return the result of one of the futures.
          *
-         * @param <T>
-         *
-         * @param futures futures for tasks submitted to invokeAny.
-         * @return result of a task that completed successfully. If none completed successfully or exceptionally or were canceled, then returns null.
-         *         The result should be used in combination with hasSuccessfulResult in order to disambiguate null values.
-         * @throws CancellationException if no task completed successfully or exceptionally but at least one was canceled.
-         * @throws ExecutionException if no task completed successfully but at least one completed exceptionally.
+         * @param timeoutNS maximum number of nanoseconds to wait. -1 to wait without applying a timeout.
+         * @param futures list of futures for tasks submitted to invokeAny
+         * @return result of one of the futures if any are successful before the timeout elapses.
+         * @throws CancellationException if all tasks were canceled.
+         * @throws ExecutionException if all tasks completed, at least one exceptionally or aborted, and none were successful.
+         * @throws InterruptedException if interrupted.
+         * @throws RejectedExecutionException if all tasks completed, at least one aborted, and none were successful.
+         * @throws TimeoutException if the timeout elapses before all tasks complete and no task has completed successfully.
          */
         @SuppressWarnings("unchecked")
-        <T> T completeInvokeAny(ArrayList<PolicyTaskFutureImpl<T>> futures) throws CancellationException, ExecutionException {
-            synchronized (this) {
-                thread = null;
-            }
-
-            boolean allTasksDone = pending.get() == 0;
-            if (!allTasksDone)
-                for (Future<?> f : futures)
-                    f.cancel(true);
+        <T> T await(long timeoutNS, List<PolicyTaskFutureImpl<T>> futures) throws ExecutionException, InterruptedException, TimeoutException {
+            int countdown = getCount();
+            if (countdown > 0)
+                if (timeoutNS < 0)
+                    acquireSharedInterruptibly(countdown);
+                else if (!tryAcquireSharedNanos(countdown, timeoutNS))
+                    throw new TimeoutException();
 
             Object result = this.result.get();
             if (result != this)
                 return (T) result;
-            else if (allTasksDone) { // cause ExecutionException (preferred) or CancellationException to be raised
+            else { // cause ExecutionException/RejectedExecutionException (preferred) or CancellationException to be raised
                 boolean canceled = false;
-                for (PolicyTaskFutureImpl<?> f : futures) {
+                for (PolicyTaskFutureImpl<T> f : futures) {
                     int s = f.state.get();
                     if (s == FAILED)
                         throw new ExecutionException((Throwable) f.result.get());
-                    else if (s == CANCELED || s == CANCELING)
+                    else if (s == ABORTED) {
+                        Throwable x = (Throwable) f.result.get();
+                        if (f.callback != null)
+                            f.callback.raiseAbortedException(x);
+                        throw new RejectedExecutionException(x);
+                    } else if (s == CANCELED || s == CANCELING)
                         canceled = true;
                 }
                 if (canceled)
                     throw new CancellationException();
-            } // else allow original exception to be raised (InterruptedException or TimeoutException)
-            return null;
+                else
+                    throw new IllegalStateException(this + ", " + futures); // should be unreachable
+            }
         }
 
         /**
-         * @return true if a successful result has been recorded, otherwise false.
+         * Count down by 1 if the current count is positive.
+         *
+         * @return true if counted down, otherwise false.
          */
-        boolean hasSuccessfulResult() {
-            return result.get() != this;
+        boolean countDown() {
+            return releaseShared(1);
         }
 
         /**
-         * Interrupts the thread on which invokeAny is running so that it can complete.
+         * Count down the latch to 0 if the specified value can be set as the result.
+         *
+         * @param result successful result for invokeAny
+         * @return true if we set the result and counted down to 0, otherwise false.
          */
-        private synchronized void notifyInvokeAny() {
-            if (thread != null)
-                try {
-                    AccessController.doPrivileged(new InterruptAction(thread));
-                } finally {
-                    thread = null;
-                }
+        boolean countDown(Object result) {
+            return this.result.compareAndSet(this, result) && releaseShared(getState());
+        }
+
+        @Trivial
+        int getCount() {
+            return getState();
+        }
+
+        @Override
+        @Trivial
+        public String toString() {
+            Object r = result.get();
+            return new StringBuilder("InvokeAnyLatch@").append(Integer.toHexString(hashCode())) //
+                            .append(' ').append("count:").append(getState()) //
+                            .append(", result:").append((r == this ? "<empty>" : r)).toString();
+        }
+
+        @Trivial
+        @Override
+        protected final int tryAcquireShared(int ignored) {
+            return getState() > 0 ? -1 : 1;
+        }
+
+        @Trivial
+        @Override
+        protected final boolean tryReleaseShared(int amount) {
+            if (amount < 0)
+                throw new IllegalArgumentException(Integer.toString(amount));
+            int count;
+            while ((count = getState()) > 0 && !compareAndSetState(count, amount > count ? 0 : count - amount));
+            return count > 0 && count <= amount;
         }
     }
 
     /**
-     * Awaitable state. Specifically, allows awaiting the transition from SUBMITTED/RUNNING to a SUCCESSFUL/CANCELING/CANCELED/FAILED state.
+     * Awaitable state. Specifically, allows awaiting the transition from PRESUBMIT/SUBMITTED/RUNNING
+     * to an ABORTED/CANCELING/CANCELED/FAILED/SUCCESSFUL state.
      */
     @Trivial
     private static class State extends AbstractQueuedSynchronizer {
@@ -211,6 +262,10 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
             return compareAndSetState(SUBMITTED, RUNNING);
         }
 
+        private boolean setSubmitted() {
+            return compareAndSetState(PRESUBMIT, SUBMITTED);
+        }
+
         @Override
         protected final int tryAcquireShared(int ignored) {
             return getState() > RUNNING ? 1 : -1;
@@ -220,41 +275,118 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
         protected final boolean tryReleaseShared(int newState) {
             int oldState;
             while (!compareAndSetState(oldState = getState(), newState));
-            return oldState == RUNNING || oldState == SUBMITTED;
+            return oldState <= RUNNING;
         }
     }
 
-    PolicyTaskFutureImpl(PolicyExecutorImpl executor, Callable<T> task) {
+    @FFDCIgnore(RejectedExecutionException.class)
+    PolicyTaskFutureImpl(PolicyExecutorImpl executor, Callable<T> task, PolicyTaskCallback callback) {
         if (task == null)
             throw new NullPointerException();
         this.callable = executor.globalExecutor.wrap(task);
+        this.callback = callback;
         this.executor = executor;
+        this.latch = null;
         this.predefinedResult = null;
         this.runnable = null;
         this.task = task;
-        this.tracker = null;
+
+        if (callback != null)
+            try {
+                callback.onSubmit(task, this, 0);
+            } catch (Error x) {
+                abort(x);
+                throw x;
+            } catch (RejectedExecutionException x) { // same as RuntimeException, but ignore FFDC
+                abort(x);
+                throw x;
+            } catch (RuntimeException x) {
+                abort(x);
+                throw x;
+            }
     }
 
-    PolicyTaskFutureImpl(PolicyExecutorImpl executor, Callable<T> task, InvokeAnyCompletionTracker tracker) {
+    @FFDCIgnore(RejectedExecutionException.class)
+    PolicyTaskFutureImpl(PolicyExecutorImpl executor, Callable<T> task, PolicyTaskCallback callback, InvokeAnyLatch latch) {
         if (task == null)
             throw new NullPointerException();
         this.callable = executor.globalExecutor.wrap(task);
+        this.callback = callback;
         this.executor = executor;
+        this.latch = latch;
         this.predefinedResult = null;
         this.runnable = null;
         this.task = task;
-        this.tracker = tracker;
+
+        if (callback != null)
+            try {
+                callback.onSubmit(task, this, latch.getCount());
+            } catch (Error x) {
+                abort(x);
+                throw x;
+            } catch (RejectedExecutionException x) { // same as RuntimeException, but ignore FFDC
+                abort(x);
+                throw x;
+            } catch (RuntimeException x) {
+                abort(x);
+                throw x;
+            }
     }
 
-    PolicyTaskFutureImpl(PolicyExecutorImpl executor, Runnable task, T predefinedResult) {
+    @FFDCIgnore(RejectedExecutionException.class)
+    PolicyTaskFutureImpl(PolicyExecutorImpl executor, Runnable task, T predefinedResult, PolicyTaskCallback callback) {
         if (task == null)
             throw new NullPointerException();
         this.callable = null;
+        this.callback = callback;
         this.executor = executor;
+        this.latch = null;
         this.predefinedResult = predefinedResult;
         this.runnable = executor.globalExecutor.wrap(task);
         this.task = task;
-        this.tracker = null;
+
+        if (callback != null)
+            try {
+                callback.onSubmit(task, this, 0);
+            } catch (Error x) {
+                abort(x);
+                throw x;
+            } catch (RejectedExecutionException x) { // same as RuntimeException, but ignore FFDC
+                abort(x);
+                throw x;
+            } catch (RuntimeException x) {
+                abort(x);
+                throw x;
+            }
+    }
+
+    /**
+     * Invoked to abort a task.
+     *
+     * @param cause the cause of the abort.
+     * @return true if the future transitioned to ABORTED state.
+     */
+    final boolean abort(Throwable cause) {
+        if (nsAcceptEnd == nsAcceptBegin - 1) // currently unset
+            nsRunEnd = nsQueueEnd = nsAcceptEnd = System.nanoTime();
+        boolean aborted = result.compareAndSet(state, cause) && state.releaseShared(ABORTED);
+        if (aborted && callback != null)
+            callback.onEnd(task, this, null, true, 0, cause);
+        return aborted;
+    }
+
+    /**
+     * Invoked to indicate the task was successfully submitted.
+     *
+     * @param runOnSubmitter true if accepted to run immediately on the submitter's thread. False if accepted to the queue.
+     */
+    @Trivial
+    final void accept(boolean runOnSubmitter) {
+        long time;
+        nsAcceptEnd = time = System.nanoTime();
+        if (runOnSubmitter)
+            nsQueueEnd = time;
+        state.setSubmitted();
     }
 
     /**
@@ -278,10 +410,20 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
     public boolean cancel(boolean interruptIfRunning) {
         if (result.compareAndSet(state, CANCELED)) {
             if (executor.queue.remove(this)) {
+                nsRunEnd = nsQueueEnd = System.nanoTime();
                 state.releaseShared(CANCELED);
                 executor.maxQueueSizeConstraint.release();
                 if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
                     Tr.debug(this, tc, "canceled from queue");
+                if (callback != null)
+                    callback.onCancel(task, this, false, false);
+            } else if (state.get() == PRESUBMIT) {
+                nsRunEnd = nsQueueEnd = nsAcceptEnd = System.nanoTime();
+                state.releaseShared(CANCELED);
+                if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
+                    Tr.debug(this, tc, "canceled during pre-submit");
+                if (callback != null)
+                    callback.onCancel(task, this, false, false);
             } else if (interruptIfRunning) {
                 state.releaseShared(CANCELING);
                 Thread t = thread;
@@ -293,13 +435,17 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
                     }
                 } finally {
                     state.releaseShared(CANCELED);
+                    if (callback != null)
+                        callback.onCancel(task, this, false, true);
                 }
             } else {
                 state.releaseShared(CANCELED);
+                if (callback != null)
+                    callback.onCancel(task, this, false, true);
             }
 
-            if (tracker != null && tracker.pending.decrementAndGet() == 0)
-                tracker.notifyInvokeAny();
+            if (latch != null)
+                latch.countDown();
 
             return true;
         } else {
@@ -313,15 +459,26 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
     @SuppressWarnings("unchecked")
     @Override
     public T get() throws InterruptedException, ExecutionException {
-        state.acquireSharedInterruptibly(1);
-        switch (state.get()) {
+        int s = state.get();
+        if (s == SUBMITTED || s == RUNNING && thread != Thread.currentThread()) {
+            state.acquireSharedInterruptibly(1);
+            s = state.get();
+        }
+        switch (s) {
             case SUCCESSFUL:
                 return (T) result.get();
+            case ABORTED:
+                if (callback != null)
+                    callback.raiseAbortedException((Throwable) result.get());
+                throw new RejectedExecutionException((Throwable) result.get());
             case FAILED:
                 throw new ExecutionException((Throwable) result.get());
             case CANCELED:
             case CANCELING:
                 throw new CancellationException();
+            case RUNNING: // only possible when get() is invoked from thread of execution and therefore blocks completion
+            case PRESUBMIT: // only possible when get() is invoke from onStart, which runs on the submitter's thread and therefore blocks completion
+                throw new InterruptedException(); // TODO message
             default: // should be unreachable
                 throw new IllegalStateException(Integer.toString(state.get()));
         }
@@ -330,20 +487,50 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
     @SuppressWarnings("unchecked")
     @Override
     public T get(long time, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException {
-        if (state.tryAcquireSharedNanos(1, unit.toNanos(time)))
-            switch (state.get()) {
-                case SUCCESSFUL:
-                    return (T) result.get();
-                case FAILED:
-                    throw new ExecutionException((Throwable) result.get());
-                case CANCELED:
-                case CANCELING:
-                    throw new CancellationException();
-                default: // should be unreachable
-                    throw new IllegalStateException(Integer.toString(state.get()));
-            }
-        else
-            throw new TimeoutException();
+        int s = state.get();
+        if (s == SUBMITTED || s == RUNNING && thread != Thread.currentThread())
+            if (state.tryAcquireSharedNanos(1, unit.toNanos(time)))
+                s = state.get();
+            else
+                throw new TimeoutException();
+        switch (s) {
+            case SUCCESSFUL:
+                return (T) result.get();
+            case ABORTED:
+                if (callback != null)
+                    callback.raiseAbortedException((Throwable) result.get());
+                throw new RejectedExecutionException((Throwable) result.get());
+            case FAILED:
+                throw new ExecutionException((Throwable) result.get());
+            case CANCELED:
+            case CANCELING:
+                throw new CancellationException();
+            case RUNNING: // only possible when get() is invoked from thread of execution and therefore blocks completion
+            case PRESUBMIT: // only possible when get() is invoke from onStart, which runs on the submitter's thread and therefore blocks completion
+                throw new InterruptedException(); // TODO message
+            default: // should be unreachable
+                throw new IllegalStateException(Integer.toString(state.get()));
+        }
+    }
+
+    @Override
+    public final long getElapsedAcceptTime(TimeUnit unit) {
+        long elapsed = nsAcceptEnd - nsAcceptBegin;
+        return unit.convert(elapsed >= 0 ? elapsed : System.nanoTime() - nsAcceptBegin, TimeUnit.NANOSECONDS);
+    }
+
+    @Override
+    public final long getElapsedQueueTime(TimeUnit unit) {
+        long begin = nsAcceptEnd;
+        long elapsed = nsQueueEnd - begin;
+        return unit.convert(elapsed >= 0 ? elapsed : begin - nsAcceptBegin > 0 ? System.nanoTime() - begin : 0, TimeUnit.NANOSECONDS);
+    }
+
+    @Override
+    public final long getElapsedRunTime(TimeUnit unit) {
+        long begin = nsQueueEnd;
+        long elapsed = nsRunEnd - begin;
+        return unit.convert(elapsed >= 0 ? elapsed : begin - nsAcceptBegin > 0 ? System.nanoTime() - begin : 0, TimeUnit.NANOSECONDS);
     }
 
     @Override
@@ -368,35 +555,65 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
         if (!state.setRunning()) {
             if (trace && tc.isDebugEnabled())
                 Tr.debug(this, tc, "unable to run", state.get());
+            nsRunEnd = System.nanoTime();
+            if (callback != null)
+                callback.onEnd(task, this, null, true, 0, null); // aborted, queued task will never run
             return;
         }
 
+        boolean aborted = true;
+        Object callbackContext = null;
         thread = Thread.currentThread();
         try {
-            T t;
-            if (callable == null) {
-                runnable.run();
-                t = predefinedResult;
-            } else {
-                t = callable.call();
+            if (callback == null)
+                aborted = false;
+            else {
+                callbackContext = callback.onStart(task, this);
+                aborted = state.get() == CANCELED;
             }
 
-            if (result.compareAndSet(state, t)) {
-                state.releaseShared(SUCCESSFUL);
-                if (tracker != null && tracker.result.compareAndSet(tracker, t))
-                    tracker.notifyInvokeAny();
+            if (aborted)
+                nsRunEnd = System.nanoTime();
+            else {
+                T t;
+                if (callable == null) {
+                    runnable.run();
+                    t = predefinedResult;
+                } else {
+                    t = callable.call();
+                }
+
+                nsRunEnd = System.nanoTime();
+
+                if (result.compareAndSet(state, t)) {
+                    state.releaseShared(SUCCESSFUL);
+                    if (latch != null)
+                        latch.countDown(t);
+                }
+
+                if (trace && tc.isDebugEnabled())
+                    Tr.debug(this, tc, "run", t);
             }
 
-            if (trace && tc.isDebugEnabled())
-                Tr.debug(this, tc, "run", t);
+            if (callback != null)
+                try {
+                    callback.onEnd(task, this, callbackContext, aborted, 0, null);
+                } catch (Throwable x) {
+                }
         } catch (Throwable x) {
             if (trace && tc.isDebugEnabled())
                 Tr.debug(this, tc, "run", x);
+
+            nsRunEnd = System.nanoTime();
+
             if (result.compareAndSet(state, x)) {
-                state.releaseShared(FAILED);
-                if (tracker != null && tracker.pending.decrementAndGet() == 0)
-                    tracker.notifyInvokeAny();
+                state.releaseShared(aborted ? ABORTED : FAILED);
+                if (latch != null)
+                    latch.countDown();
             }
+
+            if (callback != null)
+                callback.onEnd(task, this, callbackContext, aborted, 0, x);
         } finally {
             thread = null;
             // Prevent accidental interrupt of subsequent operations by awaiting the transition from CANCELING to CANCELED
@@ -410,7 +627,8 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
      */
     @Trivial
     void throwIfInterrupted() throws InterruptedException {
-        if (state.get() == FAILED) {
+        int s = state.get();
+        if (s == FAILED || s == ABORTED) {
             Object x = result.get();
             if (x instanceof InterruptedException) {
                 if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled())
@@ -431,23 +649,29 @@ public class PolicyTaskFutureImpl<T> implements Future<T> {
         StringBuilder b = new StringBuilder("PolicyTaskFuture@").append(Integer.toHexString(hashCode())).append(" for ").append(task).append(' ');
         int s = state.get();
         switch (s) {
+            case PRESUBMIT:
+                b.append("PRESUBMIT");
+                break;
             case SUBMITTED:
                 b.append("SUBMITTED");
                 break;
             case RUNNING:
                 b.append("RUNNING");
                 break;
-            case SUCCESSFUL:
-                b.append("SUCCESSFUL");
-                break;
-            case FAILED:
-                b.append("FAILED");
+            case ABORTED:
+                b.append("ABORTED");
                 break;
             case CANCELING:
                 b.append("CANCELING");
                 break;
             case CANCELED:
                 b.append("CANCELED");
+                break;
+            case FAILED:
+                b.append("FAILED");
+                break;
+            case SUCCESSFUL:
+                b.append("SUCCESSFUL");
                 break;
             default:
                 b.append(s); // should be unreachable

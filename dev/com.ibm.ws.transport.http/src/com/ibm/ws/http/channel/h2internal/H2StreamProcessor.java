@@ -85,6 +85,10 @@ public class H2StreamProcessor {
     H2HttpInboundLinkWrap h2HttpInboundLinkWrap = null;
     H2InboundLink muxLink = null;
 
+    // objects to track http2 connection initialization
+    boolean connection_preface_settings_ack_rcvd = false;
+    boolean connection_preface_settings_rcvd = false;
+
     public static enum PROCESS_TYPE {
         DEFAULT, PAYLOAD_FIRST
     };
@@ -146,7 +150,14 @@ public class H2StreamProcessor {
         }
         this.frameType = FrameTypes.SETTINGS;
         try {
+            if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                Tr.debug(tc, "completeConnectionPreface processNextFrame-:  stream: " + myID + " frame type: " + currentFrame.getFrameType().toString() + " direction: "
+                             + Direction.WRITING_OUT
+                             + " H2InboundLink hc: " + muxLink.hashCode());
+            }
+
             this.writeFrameSync();
+
         } catch (FlowControlException e) {
             // FlowControlException can only occur writing DATA frames
         }
@@ -154,7 +165,14 @@ public class H2StreamProcessor {
             // the user has changed the max connection read window, so we'll update that now
             currentFrame = new FrameWindowUpdate(0, (int) muxLink.maxReadWindowSize, false);
             try {
+                if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                    Tr.debug(tc, "completeConnectionPreface processNextFrame-:  stream: " + myID + " frame type: " + currentFrame.getFrameType().toString() + " direction: "
+                                 + Direction.WRITING_OUT
+                                 + " H2InboundLink hc: " + muxLink.hashCode());
+                }
+
                 this.writeFrameSync();
+
             } catch (FlowControlException e) {
                 // FlowControlException can only occur writing DATA frames
             }
@@ -166,7 +184,8 @@ public class H2StreamProcessor {
         // Make it easy to follow frame processing in the trace by searching for "processNextFrame-" to see all fraame processing
         boolean doDebugWhile = false;
         if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
-            Tr.debug(tc, "processNextFrame-entry:  stream: " + myID + " frame type: " + frame.getFrameType().toString() + " direction: " + direction.toString());
+            Tr.debug(tc, "processNextFrame-entry:  stream: " + myID + " frame type: " + frame.getFrameType().toString() + " direction: " + direction.toString()
+                         + " H2InboundLink hc: " + muxLink.hashCode());
         }
         if (isStreamClosed()) {
             // Handle Read or Write while the stream is closed.
@@ -492,13 +511,25 @@ public class H2StreamProcessor {
     }
 
     private void readWriteTransitionState(Constants.Direction direction) throws Http2Exception {
+
+        if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+            Tr.debug(tc, "readWriteTransitionState: entry: frame type: " + currentFrame.getFrameType() + " state: " + state);
+        }
+
         if (currentFrame.getFrameType() == FrameTypes.GOAWAY
             || currentFrame.getFrameType() == FrameTypes.RST_STREAM) {
+
             writeFrameSync();
             this.updateStreamState(StreamState.CLOSED);
+
             if (currentFrame.getFrameType() == FrameTypes.GOAWAY) {
                 muxLink.goAway();
             }
+
+            if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                Tr.debug(tc, "readWriteTransitionState: return: state: " + state);
+            }
+
             return;
         }
         switch (state) {
@@ -534,6 +565,11 @@ public class H2StreamProcessor {
                 break;
 
         }
+
+        if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+            Tr.debug(tc, "readWriteTransitionState: exit: state: " + state);
+        }
+
     }
 
     /**
@@ -598,6 +634,19 @@ public class H2StreamProcessor {
                 muxLink.triggerStreamClose(this);
                 updateStreamState(StreamState.CLOSED);
 
+            } else if (frameType == FrameTypes.HEADERS || frameType == FrameTypes.CONTINUATION) {
+                if (currentFrame.flagEndHeadersSet()) {
+                    setContinuationFrameExpected(false);
+                    //if (currentFrame.flagEndStreamSet()) {
+                    //    endStream = true;
+                    // updateStreamState(StreamState.CLOSED);
+                    //}
+                } else {
+                    setContinuationFrameExpected(true);
+                    //if (currentFrame.flagEndStreamSet()) {
+                    //    endStream = true;
+                    //}
+                }
             }
         } else if (currentFrame.getFrameType() == FrameTypes.RST_STREAM) {
             endStream = true;
@@ -626,22 +675,22 @@ public class H2StreamProcessor {
         }
     }
 
+    /**
+     * Helper method to process a SETTINGS frame received from the client. Since the protocol utilizes SETTINGS frames for
+     * initialization, some special logic is needed.
+     */
     private void processSETTINGSFrame() {
         if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
             Tr.debug(tc, "processSETTINGSFrame entry");
         }
-
-        // this is the first Settings frame we're processing as part of the connection preface
-        if (!muxLink.connection_preface_settings_rcvd) {
-            muxLink.connection_preface_settings_rcvd = true;
+        // check if this is the first non-ACK settings frame received; if so, update connection init state
+        if (!connection_preface_settings_rcvd && !((FrameSettings) currentFrame).flagAckSet()) {
+            connection_preface_settings_rcvd = true;
         }
         if (((FrameSettings) currentFrame).flagAckSet()) {
-            if (!muxLink.connection_preface_settings_ack_rcvd) {
-                if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
-                    Tr.debug(tc, "connection preface completed; notify any waiting streams to continue");
-                }
-
-                muxLink.connection_preface_settings_ack_rcvd = true;
+            // if this is the first ACK frame, update connection init state
+            if (!connection_preface_settings_ack_rcvd) {
+                connection_preface_settings_ack_rcvd = true;
             }
         } else {
             if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
@@ -662,7 +711,14 @@ public class H2StreamProcessor {
             currentFrame.setAckFlag();
 
             try {
+                if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                    Tr.debug(tc, "completeConnectionPreface processNextFrame-:  stream: " + myID + " frame type: " + currentFrame.getFrameType().toString() + " direction: "
+                                 + Direction.WRITING_OUT
+                                 + " H2InboundLink hc: " + muxLink.hashCode());
+                }
+
                 writeFrameSync();
+
             } catch (FlowControlException e) {
                 // FlowControlException cannot occur for FrameTypes.SETTINGS, so do nothing here but debug
                 if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
@@ -670,6 +726,14 @@ public class H2StreamProcessor {
                 }
             }
         }
+
+        // check to see if the current connection should be marked as initialized; if so, notify stream 1 to stop waiting
+        if (connection_preface_settings_rcvd && connection_preface_settings_ack_rcvd) {
+            if (muxLink.checkInitAndOpen()) {
+                muxLink.initLock.countDown();
+            }
+        }
+
     }
 
     private void processPriorityFrame() {
@@ -870,14 +934,6 @@ public class H2StreamProcessor {
         // Can only receive HEADERS or PRIORITY frame in Idle state
         if (direction == Constants.Direction.READ_IN) {
             if (frameType == FrameTypes.HEADERS) {
-                //if END_HEADERS is set and END_STREAM is not set,
-                //    Stream goes to RemoteStarted_Open state.
-                //if END_HEADERS is not set and END_STREAM is not set,
-                //    then CONTINUATION frames must follow.  Stream is in RemoteStarted_Idle_Continuation state
-                //if END_STREAM is set and END_HEADERS is not set,
-                //    then CONTINUATION frames will still follow. Stream in RemoteStarted_Idle_EndStreamContinuation state
-                //if END_STREAM is set and END_HEADERS is set
-                //    then state goes to RemoteStarted_HalfCloseRemote state.
 
                 // process the new priority settings if any were passed in the payload
                 processHeadersPriority();
@@ -946,8 +1002,6 @@ public class H2StreamProcessor {
 
         if (direction == Constants.Direction.READ_IN) {
             if (frameType == FrameTypes.DATA) {
-                // if END_STREAM is set: change Stream state to RemoteStarted_HalfCloseRemote
-                // if END_STREAM is not set: wait for more frames to arrive, Stream remains RemoteStarted_Open
                 getBodyFromFrame();
                 if (currentFrame.flagEndStreamSet()) {
                     endStream = true;
@@ -964,10 +1018,6 @@ public class H2StreamProcessor {
                 // writing out a PP doesn't have any effect on the current stream, but rather the promised stream
 
             } else if (frameType == FrameTypes.HEADERS || frameType == FrameTypes.CONTINUATION) {
-                //if END_HEADERS is set, Stream stays in RemoteStarted_Open.
-                //if END_HEADERS is not set, then CONTINUATION frames must follow.  change Stream to RemoteStarted_Open_Continuation
-                //if END_STREAM without END_HEADERS, then CONTINUATION frames will still follow. Stream in RemoteStarted_Open_EndStreamContinuation state
-                //if END_STREAM and END_HEADERS then change Stream state to RemoteStarted_HalfCloseLocal.
                 if (currentFrame.flagEndHeadersSet()) {
                     setContinuationFrameExpected(false);
                     if (currentFrame.flagEndStreamSet()) {
@@ -984,9 +1034,6 @@ public class H2StreamProcessor {
             }
             boolean writeCompleted = writeFrameSync();
             if (frameType == FrameTypes.DATA && writeCompleted && currentFrame.flagEndStreamSet()) {
-                // Writing the HTTP/2 representation of the HTTP Response body here
-                // if END_STREAM is set, change Stream state to RemoteStarted_HalfCloseLocal
-                // if END_STREAM is not set, wait for more frames to write, Stream remains RemoteStarted_Open state.
                 endStream = true;
                 updateStreamState(StreamState.HALF_CLOSED_LOCAL);
             }
@@ -1587,7 +1634,7 @@ public class H2StreamProcessor {
 
         if (state == StreamState.CLOSED) {
             if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
-                Tr.debug(tc, "isStreamClosed stream closed; stream: " + myID);
+                Tr.debug(tc, "isStreamClosed stream closed; " + streamId());
             }
             return true;
         }
@@ -1597,7 +1644,7 @@ public class H2StreamProcessor {
 
         if (rc == true) {
             if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
-                Tr.debug(tc, "isStreamClosed stream closed via muxLink check; stream: " + myID);
+                Tr.debug(tc, "isStreamClosed stream closed via muxLink check; " + streamId());
             }
         }
 
@@ -1646,5 +1693,32 @@ public class H2StreamProcessor {
 
     protected long getCloseTime() {
         return closeTime;
+    }
+
+    /**
+     * Wait on this thread/stream until the H2 connection has completed initializing
+     *
+     * @return true if this connection initialized correctly
+     */
+    public boolean waitForConnectionInit() {
+        try {
+            if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                Tr.debug(tc, "waitForConnectionInit: waiting for the H2 connection to complete initialization on " + streamId());
+            }
+            // the connection isn't initialized yet; wait on the init lock
+            muxLink.initLock.await();
+            // check to see if the initialization failed
+            if (TraceComponent.isAnyTracingEnabled() && tc.isDebugEnabled()) {
+                Tr.debug(tc, "waitForConnectionInit: stop waiting, H2 connection initialized " + streamId());
+            }
+            return true;
+        } catch (InterruptedException e) {
+            // server error handled in caller
+            return false;
+        }
+    }
+
+    private String streamId() {
+        return "stream-id: " + myID;
     }
 }

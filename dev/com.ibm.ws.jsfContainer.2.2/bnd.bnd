@@ -28,6 +28,7 @@ Import-Package: \
 Include-Resource: \
     META-INF=@src/META-INF
   
+# All of this code runs in the application classloader
 instrument.disabled: true
 
 -buildpath: \
@@ -47,4 +48,4 @@ instrument.disabled: true
 	
 -testpath: \
     ../build.sharedResources/lib/junit/old/junit.jar;version=file, \
-    ../build.sharedResources/lib/ws-junit/ws-junit.jar;version=file
+    com.ibm.ws.junit.extensions;version=latest
