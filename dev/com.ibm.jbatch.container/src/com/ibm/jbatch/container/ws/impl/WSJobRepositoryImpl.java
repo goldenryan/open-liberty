@@ -10,8 +10,11 @@
  *******************************************************************************/
 package com.ibm.jbatch.container.ws.impl;
 
+import java.rmi.RemoteException;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
@@ -20,6 +23,7 @@ import javax.batch.operations.JobSecurityException;
 import javax.batch.operations.NoSuchJobExecutionException;
 import javax.batch.operations.NoSuchJobInstanceException;
 import javax.batch.runtime.BatchStatus;
+import javax.security.auth.Subject;
 
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.ConfigurationPolicy;
@@ -41,6 +45,14 @@ import com.ibm.jbatch.container.ws.WSJobRepository;
 import com.ibm.jbatch.container.ws.WSRemotablePartitionExecution;
 import com.ibm.jbatch.container.ws.WSStepThreadExecutionAggregate;
 import com.ibm.jbatch.spi.BatchSecurityHelper;
+import com.ibm.websphere.security.CustomRegistryException;
+import com.ibm.websphere.security.EntryNotFoundException;
+import com.ibm.websphere.security.UserRegistry;
+import com.ibm.websphere.security.WSSecurityException;
+import com.ibm.websphere.security.cred.WSCredential;
+import com.ibm.ws.security.AccessIdUtil;
+import com.ibm.ws.security.authentication.utility.SubjectHelper;
+import com.ibm.wsspi.security.registry.RegistryHelper;
 
 /**
  * {@inheritDoc}
@@ -397,6 +409,58 @@ public class WSJobRepositoryImpl implements WSJobRepository {
 
     @Override
     public WSJobInstance updateJobInstanceWithGroupNames(long jobInstanceId, Set<String> groupNames) {
-        return persistenceManagerService.updateJobInstanceWithGroupNames(jobInstanceId, groupNames);
+
+        Set<String> normalizedNames = new HashSet<String>();
+
+        normalizedNames = normalizeGroupNames(groupNames);
+
+        return persistenceManagerService.updateJobInstanceWithGroupNames(jobInstanceId, normalizedNames);
+    }
+
+    protected Set<String> normalizeGroupNames(Set<String> groupNames) {
+
+        Subject subject = batchSecurityHelper.getRunAsSubject();
+        SubjectHelper sh = new SubjectHelper();
+        WSCredential cred;
+        cred = sh.getWSCredential(subject);
+        String realmName = null;
+        Iterator it = groupNames.iterator();
+        Set<String> longGrpNames = new HashSet<String>();
+
+        UserRegistry ur = null;
+
+        try {
+            realmName = sh.getRealm(subject);
+            ur = RegistryHelper.getUserRegistry(realmName);
+        } catch (WSSecurityException wsecEx) {
+            throw new RuntimeException(wsecEx);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        String longGroupName = null;
+
+        while (it.hasNext()) {
+
+            try {
+                String currName = (String) it.next();
+                longGroupName = null;
+
+                if (ur.isValidGroup(currName)) {
+                    longGroupName = AccessIdUtil.createAccessId("group", realmName, ur.getUniqueGroupId(currName));
+                    longGrpNames.add(longGroupName);
+                } else {
+                    //this should be a more valid message string
+                    System.out.println("AJM: invalid group name - will not add");
+                }
+            } catch (EntryNotFoundException enfEx) {
+                throw new RuntimeException(enfEx);
+            } catch (CustomRegistryException crEx) {
+                throw new RuntimeException(crEx);
+            } catch (RemoteException re) {
+                throw new RuntimeException(re);
+            }
+        }
+        return longGrpNames;
     }
 }
