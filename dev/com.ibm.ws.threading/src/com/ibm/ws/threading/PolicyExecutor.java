@@ -59,9 +59,15 @@ public interface PolicyExecutor extends ExecutorService {
      * @return the executor.
      * @throws IllegalArgumentException if value is negative or greater than maximum concurrency.
      * @throws IllegalStateException if the executor has been shut down.
-     * @throws UnsupportedOperationException if invoked on a <code>concurrencyPolicy</code> instance created from server configuration.
      */
     PolicyExecutor expedite(int num);
+
+    /**
+     * Returns the number of tasks from this PolicyExecutor currently running on the global executor.
+     *
+     * @return the number of running tasks
+     */
+    int getRunningTaskCount();
 
     /**
      * Submits and invokes a group of tasks with a callback per task to be invoked at various points in the task's life cycle.
@@ -115,7 +121,6 @@ public interface PolicyExecutor extends ExecutorService {
      * @return the executor.
      * @throws IllegalArgumentException if value is not positive or -1 (which means Integer.MAX_VALUE) or less than the number to expedite.
      * @throws IllegalStateException if the executor has been shut down.
-     * @throws UnsupportedOperationException if invoked on a <code>concurrencyPolicy</code> instance created from server configuration.
      */
     PolicyExecutor maxConcurrency(int max);
 
@@ -129,7 +134,6 @@ public interface PolicyExecutor extends ExecutorService {
      * @param policy indicates whether or not tasks that run on the invoking thread count towards maximum concurrency.
      * @return the executor.
      * @throws IllegalStateException if the executor has been shut down.
-     * @throws UnsupportedOperationException if invoked on a <code>concurrencyPolicy</code> instance created from server configuration.
      */
     PolicyExecutor maxPolicy(MaxPolicy policy);
 
@@ -150,7 +154,6 @@ public interface PolicyExecutor extends ExecutorService {
      * @return the executor.
      * @throws IllegalArgumentException if value is not positive or -1 (which means Integer.MAX_VALUE).
      * @throws IllegalStateException if the executor has been shut down.
-     * @throws UnsupportedOperationException if invoked on a <code>concurrencyPolicy</code> instance created from server configuration.
      */
     PolicyExecutor maxQueueSize(int max);
 
@@ -166,9 +169,71 @@ public interface PolicyExecutor extends ExecutorService {
      * @return the executor.
      * @throws IllegalArgumentException if value is negative.
      * @throws IllegalStateException if the executor has been shut down.
-     * @throws UnsupportedOperationException if invoked on a <code>concurrencyPolicy</code> instance created from server configuration.
      */
     PolicyExecutor maxWaitForEnqueue(long ms);
+
+    /**
+     * Returns the number of additional tasks that can be enqueued without exceeding the maximum queue size.
+     *
+     * @return remaining capacity in queue
+     */
+    int queueCapacityRemaining();
+
+    /**
+     * Registers a one-time callback to be invoked asynchronously
+     * when the count of running tasks exceeds the specified maximum.
+     * If a concurrency callback is already registered, this replaces
+     * the previous registration.
+     * To unregister an existing callback without replacing,
+     * specify a null value for the callback.
+     * The callback is automatically unregistered upon shutdown.
+     *
+     * @param max threshold for maximum concurrency beyond which the callback should be notified.
+     * @param callback the callback, or null to unregister.
+     * @return callback that was replaced or removed by the new registration.
+     *         null if no previous callback was in place.
+     * @throws IllegalStateException if the executor has been shut down.
+     */
+    Runnable registerConcurrencyCallback(int max, Runnable callback);
+
+    /**
+     * Registers a one-time callback to be invoked asynchronously when
+     * the difference between task start time and submit time exceeds the specified maximum delay.
+     * If a late start callback is already registered, this replaces
+     * the previous registration.
+     * To unregister an existing callback without replacing,
+     * specify a null value for the callback.
+     * The callback is automatically unregistered upon shutdown.
+     *
+     * @param maxDelay maximum delay for a task to start, beyond which the callback should be notified.
+     * @param unit unit of time.
+     * @param callback the callback, or null to unregister.
+     * @return callback that was replaced or removed by the new registration.
+     *         null if no previous callback was in place.
+     * @throws IllegalArgumentException if maxDelay is greater than or equal to the
+     *             maximum number of nanoseconds representable as a long value.
+     * @throws IllegalStateException if the executor has been shut down.
+     */
+    Runnable registerLateStartCallback(long maxDelay, TimeUnit unit, Runnable callback);
+
+    /**
+     * Registers a one-time callback to be invoked asynchronously
+     * when the available remaining capacity of the task queue
+     * drops below the specified minimum.
+     * If a queue size callback is already registered, this replaces
+     * the previous registration.
+     * To unregister an existing callback without replacing,
+     * specify a null value for the callback.
+     * The callback is automatically unregistered upon shutdown.
+     *
+     * @param minAvailable threshold for minimum available queue capacity
+     *            below which the callback should be notified.
+     * @param callback the callback, or null to unregister.
+     * @return callback that was replaced or removed by the new registration.
+     *         null if no previous callback was in place.
+     * @throws IllegalStateException if the executor has been shut down.
+     */
+    Runnable registerQueueSizeCallback(int minAvailable, Runnable callback);
 
     /**
      * Applies when using the <code>execute</code> or <code>submit</code> methods. Indicates whether or not to run the task on the
@@ -180,7 +245,6 @@ public interface PolicyExecutor extends ExecutorService {
      *            false to abort the task in this case.
      * @return the executor.
      * @throws IllegalStateException if the executor has been shut down.
-     * @throws UnsupportedOperationException if invoked on a <code>concurrencyPolicy</code> instance created from server configuration.
      */
     PolicyExecutor runIfQueueFull(boolean runIfFull);
 
@@ -195,7 +259,6 @@ public interface PolicyExecutor extends ExecutorService {
      * @return the executor.
      * @throws IllegalArgumentException if value is negative (other than -1) or too large to convert to a nanosecond <code>long</code> value.
      * @throws IllegalStateException if the executor has been shut down.
-     * @throws UnsupportedOperationException if invoked on a <code>concurrencyPolicy</code> instance created from server configuration.
      */
     PolicyExecutor startTimeout(long ms);
 

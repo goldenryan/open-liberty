@@ -18,7 +18,6 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -43,7 +42,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Phaser;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -935,6 +933,80 @@ public class PolicyExecutorServlet extends FATServlet {
         try {
             fail("get of canceled future [5] must fail: " + future5.get(TIMEOUT_NS, TimeUnit.NANOSECONDS));
         } catch (CancellationException x) {
+        } // pass
+    }
+
+    // Register concurrency callbacks with a policy executor. Verify that at most one can be registered,
+    // that the most recently registered replaces any previous ones, and that the concurrency callback
+    // can be unregistered by supplying null. Verify that the concurrency callback is notified when the
+    // number of running tasks exceeds the threshold.
+    @Test
+    public void testConcurrencyCallback() throws Exception {
+        PolicyExecutor executor = provider.create("testConcurrencyCallback")
+                        .maxConcurrency(3);
+
+        CountDownLatch over0Latch = new CountDownLatch(1);
+        Runnable callbackOver0 = new CountDownCallback(over0Latch);
+        assertNull(executor.registerConcurrencyCallback(0, callbackOver0));
+        assertEquals(1, over0Latch.getCount());
+
+        // new registration replaces previous
+        CountDownLatch over1Latch = new CountDownLatch(1);
+        Runnable callbackOver1 = new CountDownCallback(over1Latch);
+        assertEquals(callbackOver0, executor.registerConcurrencyCallback(1, callbackOver1));
+        assertEquals(1, over1Latch.getCount());
+
+        // previously registered callback is not invoked
+        CountDownLatch blocker1StartedLatch = new CountDownLatch(1);
+        CountDownLatch blockerContinueLatch = new CountDownLatch(1);
+        CountDownTask blocker1Task = new CountDownTask(blocker1StartedLatch, blockerContinueLatch, TimeUnit.MINUTES.toNanos(9));
+        Future<Boolean> blocker1Future = executor.submit(blocker1Task);
+        assertTrue(blocker1StartedLatch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertEquals(1, over0Latch.getCount());
+        assertEquals(1, over1Latch.getCount());
+
+        // trigger the active callback by starting another task, such that 2 are running
+        CountDownLatch blocker2StartedLatch = new CountDownLatch(1);
+        CountDownTask blocker2Task = new CountDownTask(blocker2StartedLatch, blockerContinueLatch, TimeUnit.MINUTES.toNanos(9));
+        Future<Boolean> blocker2Future = executor.submit(blocker2Task);
+        assertTrue(blocker2StartedLatch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertTrue(over1Latch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertEquals(1, over0Latch.getCount());
+
+        // register a callback for a threshold that has already been reached
+        assertNull(executor.registerConcurrencyCallback(0, callbackOver0));
+        assertTrue(over0Latch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+
+        // register another callback which hasn't been reached
+        CountDownLatch over2Latch = new CountDownLatch(1);
+        Runnable callbackOver2 = new CountDownCallback(over2Latch);
+        assertNull(executor.registerConcurrencyCallback(2, callbackOver2));
+        assertEquals(1, over2Latch.getCount());
+
+        // trigger the active callback by starting another task, such that 3 are running
+        CountDownLatch blocker3StartedLatch = new CountDownLatch(1);
+        CountDownTask blocker3Task = new CountDownTask(blocker3StartedLatch, blockerContinueLatch, TimeUnit.MINUTES.toNanos(9));
+        Future<Boolean> blocker3Future = executor.submit(blocker3Task);
+        assertTrue(blocker3StartedLatch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertTrue(over2Latch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+
+        // allow all 3 blocked tasks to finish
+        blockerContinueLatch.countDown();
+
+        executor.shutdown();
+        assertTrue(executor.awaitTermination(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+
+        assertTrue(blocker1Future.isDone());
+        assertTrue(blocker2Future.isDone());
+        assertTrue(blocker3Future.isDone());
+        assertFalse(blocker1Future.isCancelled());
+        assertFalse(blocker2Future.isCancelled());
+        assertFalse(blocker3Future.isCancelled());
+
+        try {
+            Runnable previous = executor.registerConcurrencyCallback(4, new CountDownCallback(new CountDownLatch(1)));
+            fail("Should not be able to register callback after shutdown. Result of register was: " + previous);
+        } catch (IllegalStateException x) {
         } // pass
     }
 
@@ -3295,18 +3367,8 @@ public class PolicyExecutorServlet extends FATServlet {
         Future<Boolean> blockerFuture = executor.submit(new CountDownTask(beginLatch, noQueueCapacityRemains, TIMEOUT_NS));
         assertTrue(beginLatch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
 
-        // TODO Update in future user story. Temporarily use internals while lacking the callback to decrement the above latch once queue capacity is used up.
-        Field f = executor.getClass().getDeclaredField("maxQueueSizeConstraint");
-        f.setAccessible(true);
-        final Semaphore q = (Semaphore) f.get(executor);
-        testThreads.submit(new Callable<Void>() {
-            @Override
-            public Void call() throws InterruptedException {
-                for (long start = System.nanoTime(); q.availablePermits() > 0 && System.nanoTime() - start < TIMEOUT_NS; Thread.sleep(100));
-                noQueueCapacityRemains.countDown();
-                return null;
-            }
-        });
+        // Register callback to decrement the above latch once queue capacity is used up.
+        assertNull(executor.registerQueueSizeCallback(1, new CountDownCallback(noQueueCapacityRemains)));
 
         // Permit is required and unavailable. Task should be run on global thread pool.
         assertNotSame(curThreadId, executor.invokeAny(oneTask));
@@ -3374,18 +3436,8 @@ public class PolicyExecutorServlet extends FATServlet {
         List<Callable<Integer>> tasks = Arrays.<Callable<Integer>> asList(new SharedIncrementTask(counter), new SharedIncrementTask(counter));
 
         final CountDownLatch noQueueCapacityRemains = new CountDownLatch(1);
-        // TODO Update in future user story. Temporarily use internals while lacking the callback to decrement the above latch once queue capacity is used up.
-        Field f = executor.getClass().getDeclaredField("maxQueueSizeConstraint");
-        f.setAccessible(true);
-        final Semaphore q = (Semaphore) f.get(executor);
-        testThreads.submit(new Callable<Void>() {
-            @Override
-            public Void call() throws InterruptedException {
-                for (long start = System.nanoTime(); q.availablePermits() > 0 && System.nanoTime() - start < TIMEOUT_NS; Thread.sleep(100));
-                noQueueCapacityRemains.countDown();
-                return null;
-            }
-        });
+        // Register a callback to decrement the above latch once queue capacity is used up.
+        assertNull(executor.registerQueueSizeCallback(1, new CountDownCallback(noQueueCapacityRemains)));
 
         Future<List<Runnable>> shutdownFuture = testThreads.submit(new ShutdownTask(executor, true, new CountDownLatch(0), noQueueCapacityRemains, TIMEOUT_NS));
 
@@ -3679,18 +3731,8 @@ public class PolicyExecutorServlet extends FATServlet {
         List<Callable<Integer>> tasks = Arrays.<Callable<Integer>> asList(new SharedIncrementTask(counter), new SharedIncrementTask(counter));
 
         final CountDownLatch noQueueCapacityRemains = new CountDownLatch(1);
-        // TODO Update in future user story. Temporarily use internals while lacking the callback to decrement the above latch once queue capacity is used up.
-        Field f = executor.getClass().getDeclaredField("maxQueueSizeConstraint");
-        f.setAccessible(true);
-        final Semaphore q = (Semaphore) f.get(executor);
-        testThreads.submit(new Callable<Void>() {
-            @Override
-            public Void call() throws InterruptedException {
-                for (long start = System.nanoTime(); q.availablePermits() > 0 && System.nanoTime() - start < TIMEOUT_NS; Thread.sleep(100));
-                noQueueCapacityRemains.countDown();
-                return null;
-            }
-        });
+        // Register a callback to decrement the above latch once queue capacity is used up.
+        assertNull(executor.registerQueueSizeCallback(1, new CountDownCallback(noQueueCapacityRemains)));
 
         Future<List<Runnable>> shutdownFuture = testThreads.submit(new ShutdownTask(executor, true, new CountDownLatch(0), noQueueCapacityRemains, TIMEOUT_NS));
 
@@ -3857,6 +3899,65 @@ public class PolicyExecutorServlet extends FATServlet {
         assertTrue(terminationFuture.get(TIMEOUT_NS, TimeUnit.NANOSECONDS));
     }
 
+    // Register late start callbacks with a policy executor. Verify that at most one can be registered,
+    // that the most recently registered replaces any previous ones, and that the late start callback
+    // can be unregistered by supplying null. Verify that the late start callback is notified when a
+    // task starts after the designated threshold.
+    @Test
+    public void testLateStartCallback() throws Exception {
+        PolicyExecutor executor = provider.create("testLateStartCallback")
+                        .maxConcurrency(1)
+                        .maxQueueSize(1)
+                        .maxWaitForEnqueue(TimeUnit.NANOSECONDS.toMillis(TIMEOUT_NS));
+
+        CountDownLatch lateBy3MinutesLatch = new CountDownLatch(1);
+        Runnable lateBy3MinutesCallback = new CountDownCallback(lateBy3MinutesLatch);
+        assertNull(executor.registerLateStartCallback(3, TimeUnit.MINUTES, lateBy3MinutesCallback));
+
+        // use up maxConcurrency
+        CountDownLatch blocker1StartedLatch = new CountDownLatch(1);
+        CountDownLatch blockerContinueLatch = new CountDownLatch(1);
+        CountDownTask blocker1Task = new CountDownTask(blocker1StartedLatch, blockerContinueLatch, TimeUnit.MINUTES.toNanos(9));
+        Future<Boolean> blocker1Future = executor.submit(blocker1Task);
+
+        // queue another task
+        PolicyTaskFuture<Integer> lateTaskFuture = executor.submit(new SharedIncrementTask(), 1, null);
+        assertTrue(blocker1StartedLatch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertEquals(1, lateBy3MinutesLatch.getCount());
+
+        // new registration replaces previous
+        CountDownLatch lateBy200MillisLatch = new CountDownLatch(1);
+        Runnable lateBy200MillisCallback = new CountDownCallback(lateBy200MillisLatch);
+        assertEquals(lateBy3MinutesCallback, executor.registerLateStartCallback(200, TimeUnit.MILLISECONDS, lateBy200MillisCallback));
+
+        // wait for task to become late, and then allow it to run
+        TimeUnit.MILLISECONDS.sleep(300 - lateTaskFuture.getElapsedAcceptTime(TimeUnit.MILLISECONDS) - lateTaskFuture.getElapsedQueueTime(TimeUnit.MILLISECONDS)); // extra 100ms tolerance
+        blockerContinueLatch.countDown();
+
+        assertTrue(lateBy200MillisLatch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertEquals(1, lateBy3MinutesLatch.getCount());
+
+        // register another callback which hasn't been reached
+        assertNull(executor.registerLateStartCallback(3, TimeUnit.MINUTES, lateBy3MinutesCallback));
+        assertEquals(1, lateBy3MinutesLatch.getCount());
+
+        assertEquals(Integer.valueOf(1), lateTaskFuture.get(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+
+        assertTrue(blocker1Future.isDone());
+        assertFalse(blocker1Future.isCancelled());
+
+        executor.shutdown();
+        assertTrue(executor.awaitTermination(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+
+        assertEquals(1, lateBy3MinutesLatch.getCount()); // never invoked
+
+        try {
+            Runnable previous = executor.registerLateStartCallback(5, TimeUnit.SECONDS, new CountDownCallback(new CountDownLatch(1)));
+            fail("Should not be able to register callback after shutdown. Result of register was: " + previous);
+        } catch (IllegalStateException x) {
+        } // pass
+    }
+
     // Invoke groups of tasks on the policy executor that break themselves into multiple tasks that also
     // invoke groups of tasks on the policy executor, which in turn break themselves down and
     // invoke more groups of tasks, and so forth.
@@ -3905,6 +4006,74 @@ public class PolicyExecutorServlet extends FATServlet {
 
         executor.shutdown();
         assertTrue(executor.awaitTermination(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+    }
+
+    // Register queue size callbacks with a policy executor. Verify that at most one can be registered,
+    // that the most recently registered replaces any previous ones, and that the queue size callback
+    // can be unregistered by supplying null. Verify that the queue size callback is notified when the
+    // queue size drops below the threshold.
+    @Test
+    public void testQueueSizeCallback() throws Exception {
+        PolicyExecutor executor = provider.create("testQueueSizeCallback")
+                        .maxConcurrency(1)
+                        .maxQueueSize(5);
+
+        CountDownLatch under5Latch = new CountDownLatch(1);
+        Runnable callbackUnder5 = new CountDownCallback(under5Latch);
+        assertNull(executor.registerQueueSizeCallback(5, callbackUnder5));
+        assertEquals(1, under5Latch.getCount());
+
+        // new registration replaces previous
+        CountDownLatch under4Latch = new CountDownLatch(1);
+        Runnable callbackUnder4 = new CountDownCallback(under4Latch);
+        assertEquals(callbackUnder5, executor.registerQueueSizeCallback(4, callbackUnder4));
+        assertEquals(1, under4Latch.getCount());
+
+        // previously registered callback is not invoked
+        CountDownLatch blockerStartedLatch = new CountDownLatch(1);
+        CountDownLatch blockerContinueLatch = new CountDownLatch(1);
+        CountDownTask blockerTask = new CountDownTask(blockerStartedLatch, blockerContinueLatch, TimeUnit.MINUTES.toNanos(8));
+        Future<Boolean> blockerFuture = executor.submit(blockerTask);
+        assertTrue(blockerStartedLatch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertEquals(1, under5Latch.getCount());
+        assertEquals(1, under4Latch.getCount());
+
+        // add a task to the queue (will be stuck until blocker completes), such that capacity of 4 remains
+        Future<Integer> queuedFuture1 = executor.submit((Callable<Integer>) new SharedIncrementTask());
+        assertEquals(1, under4Latch.getCount());
+        assertEquals(1, under5Latch.getCount());
+
+        // trigger the active callback (under4Latch) by adding another task to the queue
+        Future<Integer> queuedFuture2 = executor.submit((Callable<Integer>) new SharedIncrementTask());
+        assertTrue(under4Latch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertEquals(1, under5Latch.getCount());
+
+        // register another callback
+        CountDownLatch under3Latch = new CountDownLatch(1);
+        Runnable callbackUnder3 = new CountDownCallback(under3Latch);
+        assertNull(executor.registerQueueSizeCallback(3, callbackUnder3));
+        assertEquals(1, under3Latch.getCount());
+
+        // trigger the active callback (under3Latch) by shrinking the queue
+        executor.maxQueueSize(4);
+        assertTrue(under3Latch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertEquals(1, under5Latch.getCount());
+
+        // register a callback for a threshold that has already been reached
+        CountDownLatch under6Latch = new CountDownLatch(1);
+        Runnable callbackUnder6 = new CountDownCallback(under6Latch);
+        assertNull(executor.registerQueueSizeCallback(6, callbackUnder6));
+        assertTrue(under6Latch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+
+        List<Runnable> canceledFromQueue = executor.shutdownNow();
+        assertEquals(2, canceledFromQueue.size());
+        assertTrue(blockerFuture.isCancelled());
+
+        try {
+            Runnable previous = executor.registerQueueSizeCallback(10, new CountDownCallback(new CountDownLatch(1)));
+            fail("Should not be able to register callback after shutdown. Result of register was: " + previous);
+        } catch (IllegalStateException x) {
+        } // pass
     }
 
     // Use a policy executor to submit tasks that resubmit themselves to perform a recursive computation.
@@ -4330,15 +4499,20 @@ public class PolicyExecutorServlet extends FATServlet {
             Integer result = future.get(TIMEOUT_NS, TimeUnit.NANOSECONDS);
             fail("Task should be been aborted, instead result is: " + result);
         } catch (RejectedExecutionException x) {
-            // TODO check the message of the cause exception once we add it
-        } // pass - aborted due to timeout
+            if (x.getMessage() == null || !x.getMessage().contains("CWWKE1205E"))
+                throw x;
+            // else pass - aborted due to timeout
+        }
 
         // Task must have 0 run time, and its queue time must stop changing after abort
         long queueTimeNS = future.getElapsedQueueTime(TimeUnit.NANOSECONDS);
         assertTrue(future.isDone());
         assertFalse(future.isCancelled());
         assertEquals(0, future.getElapsedRunTime(TimeUnit.NANOSECONDS));
-        assertEquals(queueTimeNS, future.getElapsedQueueTime(TimeUnit.NANOSECONDS));
+        boolean sameQueueTime = false;
+        for (long start = System.nanoTime(); !sameQueueTime && System.nanoTime() - start < TIMEOUT_NS; Thread.sleep(200))
+            sameQueueTime = queueTimeNS == future.getElapsedQueueTime(TimeUnit.NANOSECONDS);
+        assertTrue(sameQueueTime);
 
         // Additional testing for the measured run time of the blocker task
         assertTrue(blockerFuture.get(TIMEOUT_NS, TimeUnit.NANOSECONDS));
@@ -4411,15 +4585,19 @@ public class PolicyExecutorServlet extends FATServlet {
             Integer result = future2.get(TIMEOUT_NS, TimeUnit.NANOSECONDS);
             fail("Task 2 should be been aborted, instead result is: " + result);
         } catch (RejectedExecutionException x) {
-            // TODO check the message of the cause exception once we add it
-        } // pass - aborted due to timeout
+            if (x.getMessage() == null || !x.getMessage().contains("CWWKE1205E"))
+                throw x;
+            // else pass - aborted due to timeout
+        }
 
         try {
             Integer result = future3.get(TIMEOUT_NS, TimeUnit.NANOSECONDS);
             fail("Task 3 should be been aborted, instead result is: " + result);
         } catch (RejectedExecutionException x) {
-            // TODO check the message of the cause exception once we add it
-        } // pass - aborted due to timeout
+            if (x.getMessage() == null || !x.getMessage().contains("CWWKE1205E"))
+                throw x;
+            // else pass - aborted due to timeout
+        }
 
         assertEquals(0, future2.getElapsedRunTime(TimeUnit.NANOSECONDS));
         assertEquals(0, future3.getElapsedRunTime(TimeUnit.NANOSECONDS));
@@ -4485,8 +4663,10 @@ public class PolicyExecutorServlet extends FATServlet {
             Integer result = future1.get(TIMEOUT_NS, TimeUnit.NANOSECONDS);
             fail("Task 1 should be been aborted, instead result is: " + result);
         } catch (RejectedExecutionException x) {
-            // TODO check the message of the cause exception once we add it
-        } // pass - aborted due to timeout
+            if (x.getMessage() == null || !x.getMessage().contains("CWWKE1205E"))
+                throw x;
+            // else pass - aborted due to timeout
+        }
 
         assertFalse(future2.isDone());
 
@@ -5476,4 +5656,87 @@ public class PolicyExecutorServlet extends FATServlet {
         executor.shutdownNow();
     }
 
+    //Test the getRunningTaskCount method
+    @Test
+    public void testGetRunningTaskCount() throws Exception {
+        PolicyExecutor executor = provider.create("testgetRunningTaskCount").maxConcurrency(2);
+
+        CountDownLatch beginLatch1 = new CountDownLatch(1);
+        CountDownLatch continueLatch1 = new CountDownLatch(1);
+        CountDownLatch beginLatch2 = new CountDownLatch(1);
+        CountDownLatch continueLatch2 = new CountDownLatch(1);
+
+        assertEquals(0, executor.getRunningTaskCount()); //no tasks running
+
+        CountDownTask task1 = new CountDownTask(beginLatch1, continueLatch1, TimeUnit.HOURS.toNanos(1));
+        Future<Boolean> future1 = executor.submit(task1); //task1 will begin running and block on continueLatch1
+        assertTrue(beginLatch1.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+
+        assertEquals(1, executor.getRunningTaskCount()); //task1 is running
+
+        CountDownTask task2 = new CountDownTask(beginLatch2, continueLatch2, TimeUnit.HOURS.toNanos(1));
+        Future<Boolean> future2 = executor.submit(task2); //task2 will begin running and block on continueLatch2
+        assertTrue(beginLatch2.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+
+        assertEquals(2, executor.getRunningTaskCount()); //task1 and task2 are running
+
+        continueLatch1.countDown(); //allow task1 to complete
+        assertTrue(future1.get(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        for (long start = System.nanoTime(); executor.getRunningTaskCount() != 1 && System.nanoTime() - start < TIMEOUT_NS; Thread.sleep(200));
+        assertEquals(1, executor.getRunningTaskCount()); //task2 is running
+
+        executor.shutdown();
+        assertEquals(1, executor.getRunningTaskCount()); //task2 is running
+
+        continueLatch2.countDown(); //allow task2 to complete
+        assertTrue(future2.get(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        for (long start = System.nanoTime(); executor.getRunningTaskCount() != 0 && System.nanoTime() - start < TIMEOUT_NS; Thread.sleep(200));
+        assertEquals(0, executor.getRunningTaskCount()); //no tasks running
+    }
+
+    //Test that testqueueCapacityRemaining is correct as tasks are queued, run, and the maxQueueSize value is changed.
+    @Test
+    public void testQueueCapacityRemaining() throws Exception {
+        PolicyExecutor executor = provider.create("testqueueCapacityRemaining").maxConcurrency(1).maxQueueSize(5);
+
+        CountDownLatch blockingBeginLatch = new CountDownLatch(1);
+        CountDownLatch blockingContinueLatch = new CountDownLatch(1);
+        CountDownLatch beginLatch = new CountDownLatch(1);
+        CountDownLatch continueLatch = new CountDownLatch(1);
+
+        assertEquals(5, executor.queueCapacityRemaining()); //no tasks in queue
+        CountDownTask blockingTask = new CountDownTask(blockingBeginLatch, blockingContinueLatch, TimeUnit.HOURS.toNanos(1));
+        Future<Boolean> blockingFuture = executor.submit(blockingTask); //blockingTask should start and block on continueLatch
+        assertTrue(blockingBeginLatch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertEquals(5, executor.queueCapacityRemaining()); //no tasks in queue, maxQueueSize=5
+
+        CountDownTask task1 = new CountDownTask(beginLatch, continueLatch, TimeUnit.HOURS.toNanos(1));
+        Future<Boolean> future1 = executor.submit(task1); // should queue
+        assertEquals(4, executor.queueCapacityRemaining()); //task1 in queue, maxQueueSize=5
+
+        executor.maxQueueSize(6);
+        assertEquals(5, executor.queueCapacityRemaining()); //task 1 in queue, maxQueueSize=6
+
+        executor.maxQueueSize(4);
+        assertEquals(3, executor.queueCapacityRemaining()); //task1 in queue, maxQueueSize=4
+
+        CountDownTask task2 = new CountDownTask(new CountDownLatch(1), new CountDownLatch(0), TimeUnit.HOURS.toNanos(1));
+        Future<Boolean> future2 = executor.submit(task2); // should queue
+        assertEquals(2, executor.queueCapacityRemaining()); //task1 and task2 in queue, maxQueueSize=4
+
+        blockingContinueLatch.countDown(); //allow blockingTask to complete
+        assertTrue(beginLatch.await(TIMEOUT_NS, TimeUnit.NANOSECONDS)); //wait for task1 to begin running
+
+        assertEquals(3, executor.queueCapacityRemaining()); //task2 in queue, maxQueueSize=4
+        continueLatch.countDown(); //allow task1 and task2 to complete
+
+        assertTrue(blockingFuture.get(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertTrue(future1.get(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+        assertTrue(future2.get(TIMEOUT_NS, TimeUnit.NANOSECONDS));
+
+        assertEquals(4, executor.queueCapacityRemaining()); //no tasks in queue, maxQueueSize=4
+
+        executor.shutdown();
+        assertEquals(0, executor.queueCapacityRemaining()); //should return 0 after shutdown
+    }
 }

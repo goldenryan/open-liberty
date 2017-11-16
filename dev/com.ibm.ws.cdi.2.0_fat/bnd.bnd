@@ -13,7 +13,9 @@ bVersion=1.0
 
 src: \
 	fat/src,\
+	test-applications/asyncEventsApp/src,\
 	test-applications/beanManagerLookupApp/src,\
+	test-applications/configuratorApp/src,\
 	test-applications/interceptionFactoryApp/src,\
 	test-applications/builtinAnnoLiteralsApp/src
 
